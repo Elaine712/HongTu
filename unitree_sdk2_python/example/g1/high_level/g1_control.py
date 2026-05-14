@@ -19,13 +19,13 @@ class CmdVelController:
 
         self.can_move = False  # 标志位：是否可以开始运动
 
-        # 订阅 /cmd_vel
-        rospy.Subscriber("/cmd_vel", Twist, self.cmd_vel_callback)
-        rospy.loginfo("Subscribed to /cmd_vel")
-
         # 订阅全局路径
         rospy.Subscriber("/move_base/GlobalPlanner/plan", Path, self.path_callback)
         rospy.loginfo("Subscribed to global path topic /move_base/GlobalPlanner/plan")
+
+        # 订阅 /cmd_vel
+        rospy.Subscriber("/cmd_vel", Twist, self.cmd_vel_callback)
+        rospy.loginfo("Subscribed to /cmd_vel")
 
     def path_callback(self, msg: Path):
         if len(msg.poses) > 0:
@@ -42,28 +42,32 @@ class CmdVelController:
         vy = msg.linear.y      # 横向移动
         wz = msg.angular.z     # 旋转
 
-        # 如果 cmd_vel 全 0，则认为不能移动
-        if vx == 0.0 and vy == 0.0 and wz == 0.0:
-            if self.can_move:
-                rospy.logwarn("Received cmd_vel is all zeros. Robot will stop.")
-            self.can_move = False
-            return
-
-        # 如果之前因为路径为空而不能动，也忽略
+        # 1. 如果因为没有全局路径而不能动，拒绝移动指令并确保机器人停止
         if not self.can_move:
-            rospy.logwarn("Global path not received or empty. Ignoring cmd_vel.")
+            rospy.logwarn_throttle(2.0, "Global path not received or empty. Ignoring cmd_vel.")
+            # 向底层发送全0速度确保安全（防止断开路径时机器人还在往前冲）
+            try:
+                self.sport_client.Move(0.0, 0.0, 0.0)
+            except Exception as e:
+                pass
             return
 
-        rospy.loginfo(f"Received cmd_vel: vx={vx:.2f}, vy={vy:.2f}, wz={wz:.2f}")
+        # 2. 正常接收速度指令，包括全0的刹车指令 (不再改变 self.can_move 的状态)
+        if vx == 0.0 and vy == 0.0 and wz == 0.0:
+            rospy.loginfo_throttle(2.0, "Received zero cmd_vel. Robot stopping.")
+        else:
+            rospy.loginfo_throttle(2.0, f"Moving: vx={vx:.2f}, vy={vy:.2f}, wz={wz:.2f}")
+
+        # 3. 将速度下发给 Unitree 底层
         try:
             self.sport_client.Move(vx, vy, wz)
         except Exception as e:
-            rospy.logerr(f"Failed to send Move command: {e}")
+            rospy.logerr_throttle(2.0, f"Failed to send Move command: {e}")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print(f"Usage: rosrun your_package cmd_vel_control.py networkInterface")
+        print(f"Usage: python3 g1_control.py networkInterface")
         sys.exit(-1)
 
     network_interface = sys.argv[1]

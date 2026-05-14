@@ -5,13 +5,11 @@
     <arg name="rviz" default="true" />
 
     <!-- 设置地图的配置文件 -->
-    <arg name="2dmap_file" default="/home/unitree/HongTu/map.yaml" />
-    <!-- <arg name="2dmap_file" default="$(find pcd_file)/grid_map/pcd2pgm/bbb.yaml" /> -->
+    <arg name="2dmap_file" default="/home/zgx/Desktop/G1map.yaml" />
     <arg name="2dmap_frame" default="map"/>
-    <arg name="2dmap_topic" default="map_2d"/>      <!-- 注意map_server的地图话题名不能为数字开头 -->
 
-    <!-- 运行地图服务器，并且加载设置的地图-->
-    <node name="map_server" pkg="map_server" type="map_server" args="$(arg 2dmap_file) /map:=$(arg 2dmap_topic)" >
+    <!-- 直接发布到标准 /map 话题 -->
+    <node name="map_server" pkg="map_server" type="map_server" args="$(arg 2dmap_file)" >
         <param name="frame_id" value="$(arg 2dmap_frame)"/>
     </node>
 

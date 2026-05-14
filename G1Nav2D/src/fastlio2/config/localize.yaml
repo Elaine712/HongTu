@@ -26,4 +26,4 @@ localizer:
   xy_offset: 1.0
   yaw_offset: 0
   yaw_resolution: 0.5
-
+  pcd_path: "/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/PCD/map.pcd"

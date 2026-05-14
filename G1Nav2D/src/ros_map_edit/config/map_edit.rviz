@@ -9,7 +9,8 @@ Panels:
       Splitter Ratio: 0.5
     Tree Height: 243
   - Class: rviz/Tool Properties
-    Expanded: ~
+    Expanded:
+      - /Map Eraser Tool1
     Name: Tool Properties
     Splitter Ratio: 0.5882350206375122
   - Class: ros_map_edit/MapEditPanel
@@ -46,7 +47,9 @@ Visualization Manager:
       Marker Topic: /virtual_walls_markers
       Name: VirtualWalls
       Namespaces:
-        {}
+        current_wall: true
+        virtual_wall_points: true
+        virtual_walls: true
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -102,13 +105,13 @@ Visualization Manager:
       Region Parameter: 1
       Region Type: 0
       Show Points: true
-    - Brush Size: 1
+    - Brush Size: 4
       Class: ros_map_edit/MapEraserTool
   Value: true
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 101.81312561035156
+      Distance: 16.714197158813477
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -116,17 +119,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: 30.475433349609375
-        Y: 22.312734603881836
-        Z: 0.14231830835342407
+        X: 0.15485970675945282
+        Y: -3.793498992919922
+        Z: -0.05779188871383667
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.5697963237762451
+      Pitch: 1.5147963762283325
       Target Frame: <Fixed Frame>
-      Yaw: 4.703178405761719
+      Yaw: 4.133166790008545
     Saved: ~
 Window Geometry:
   Displays:
@@ -140,5 +143,5 @@ Window Geometry:
   Tool Properties:
     collapsed: false
   Width: 1920
-  X: 0
-  Y: 0
+  X: 153
+  Y: 72

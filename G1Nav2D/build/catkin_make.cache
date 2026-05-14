@@ -1,0 +1,2 @@
+fastlio2:livox_ros_driver2:movebase:pointcloud_to_laserscan:ros_map_edit:tool:velocity_smoother_ema
+-DCATKIN_DEVEL_PREFIX=/home/zgx/Desktop/HongTu/G1Nav2D/devel -DCMAKE_INSTALL_PREFIX=/home/zgx/Desktop/HongTu/G1Nav2D/install -G Unix Makefiles

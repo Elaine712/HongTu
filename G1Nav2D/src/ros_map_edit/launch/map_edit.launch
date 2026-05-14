@@ -1,6 +1,6 @@
 <launch>
   <!-- Map server -->
-  <arg name="map_file" default="$(find ros_map_edit)/maps/test.yaml"/>
+  <arg name="map_file" default="/home/zgx/Desktop/G1map.yaml"/>
   <node name="map_server" pkg="map_server" type="map_server" args="$(arg map_file)"/>
 
   <!-- RViz with map editing configuration -->
