@@ -7,8 +7,3 @@
 subdirs("gtest")
 subdirs("livox_ros_driver2")
 subdirs("fastlio2")
-subdirs("pointcloud_to_laserscan")
-subdirs("tool")
-subdirs("ros_map_edit")
-subdirs("velocity_smoother_ema")
-subdirs("movebase")

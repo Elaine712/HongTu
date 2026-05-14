@@ -17,6 +17,12 @@ class CmdVelController:
         self.sport_client.SetTimeout(10.0)
         self.sport_client.Init()
 
+        # 切换到行走模式（FSM=200），使机器人能够响应运动指令
+        rospy.loginfo("Switching to walking mode (Start)...")
+        self.sport_client.Start()
+        rospy.sleep(0.5)
+        rospy.loginfo("Robot is in walking mode.")
+
         self.can_move = False  # 标志位：是否可以开始运动
 
         # 订阅全局路径
@@ -47,7 +53,7 @@ class CmdVelController:
             rospy.logwarn_throttle(2.0, "Global path not received or empty. Ignoring cmd_vel.")
             # 向底层发送全0速度确保安全（防止断开路径时机器人还在往前冲）
             try:
-                self.sport_client.Move(0.0, 0.0, 0.0)
+                self.sport_client.Move(0.0, 0.0, 0.0, continous_move=True)
             except Exception as e:
                 pass
             return
@@ -60,7 +66,7 @@ class CmdVelController:
 
         # 3. 将速度下发给 Unitree 底层
         try:
-            self.sport_client.Move(vx, vy, wz)
+            self.sport_client.Move(vx, vy, wz, continous_move=True)
         except Exception as e:
             rospy.logerr_throttle(2.0, f"Failed to send Move command: {e}")
 

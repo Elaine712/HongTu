@@ -148,11 +148,6 @@ if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   include("/home/zgx/Desktop/HongTu/G1Nav2D/build/gtest/cmake_install.cmake")
   include("/home/zgx/Desktop/HongTu/G1Nav2D/build/livox_ros_driver2/cmake_install.cmake")
   include("/home/zgx/Desktop/HongTu/G1Nav2D/build/fastlio2/cmake_install.cmake")
-  include("/home/zgx/Desktop/HongTu/G1Nav2D/build/pointcloud_to_laserscan/cmake_install.cmake")
-  include("/home/zgx/Desktop/HongTu/G1Nav2D/build/tool/cmake_install.cmake")
-  include("/home/zgx/Desktop/HongTu/G1Nav2D/build/ros_map_edit/cmake_install.cmake")
-  include("/home/zgx/Desktop/HongTu/G1Nav2D/build/velocity_smoother_ema/cmake_install.cmake")
-  include("/home/zgx/Desktop/HongTu/G1Nav2D/build/movebase/cmake_install.cmake")
 
 endif()
 

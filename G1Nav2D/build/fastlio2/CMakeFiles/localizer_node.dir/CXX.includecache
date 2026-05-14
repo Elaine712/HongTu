@@ -372,10 +372,6 @@ geometry_msgs/TransformStamped.h
 pcl_conversions/pcl_conversions.h
 -
 
-/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/include/ikd-Tree/ikd_Tree.cpp
-ikd_Tree.h
-/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/include/ikd-Tree/ikd_Tree.h
-
 /home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/include/ikd-Tree/ikd_Tree.h
 stdio.h
 -
@@ -431,22 +427,6 @@ pcl/registration/icp.h
 -
 pcl/features/normal_3d.h
 -
-
-/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/src/commons.cpp
-commons.h
-/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/src/commons.h
-
-/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/src/lio_builder/imu_processor.cpp
-lio_builder/imu_processor.h
-/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/src/lio_builder/lio_builder/imu_processor.h
-
-/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/src/lio_builder/lio_builder.cpp
-lio_builder/lio_builder.h
-/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/src/lio_builder/lio_builder/lio_builder.h
-
-/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/src/localizer/icp_localizer.cpp
-localizer/icp_localizer.h
-/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/src/localizer/localizer/icp_localizer.h
 
 /home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/src/localizer_node.cpp
 thread

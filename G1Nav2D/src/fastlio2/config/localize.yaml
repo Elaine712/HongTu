@@ -6,7 +6,7 @@ livox_topic: /livox/lidar
 
 local_rate: 30.0
 loop_rate: 1.0
-publish_map_cloud: false
+publish_map_cloud: true
 
 lio_builder:
   det_range: 100.0
@@ -22,8 +22,8 @@ localizer:
   rough_resolution: 0.5
   refine_iter: 5
   rough_iter: 10
-  thresh: 0.15
+  thresh: 0.3
   xy_offset: 1.0
-  yaw_offset: 0
+  yaw_offset: 4
   yaw_resolution: 0.5
   pcd_path: "/home/zgx/Desktop/HongTu/G1Nav2D/src/fastlio2/PCD/map.pcd"

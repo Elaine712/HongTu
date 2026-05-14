@@ -64,8 +64,8 @@ livox_ros_driver2/CMakeFiles/livox_ros_driver2_generate_messages_nodejs: /home/z
 
 /home/zgx/Desktop/HongTu/G1Nav2D/devel/share/gennodejs/ros/livox_ros_driver2/msg/CustomMsg.js: /opt/ros/noetic/lib/gennodejs/gen_nodejs.py
 /home/zgx/Desktop/HongTu/G1Nav2D/devel/share/gennodejs/ros/livox_ros_driver2/msg/CustomMsg.js: /home/zgx/Desktop/HongTu/G1Nav2D/src/livox_ros_driver2/msg/CustomMsg.msg
-/home/zgx/Desktop/HongTu/G1Nav2D/devel/share/gennodejs/ros/livox_ros_driver2/msg/CustomMsg.js: /opt/ros/noetic/share/std_msgs/msg/Header.msg
 /home/zgx/Desktop/HongTu/G1Nav2D/devel/share/gennodejs/ros/livox_ros_driver2/msg/CustomMsg.js: /home/zgx/Desktop/HongTu/G1Nav2D/src/livox_ros_driver2/msg/CustomPoint.msg
+/home/zgx/Desktop/HongTu/G1Nav2D/devel/share/gennodejs/ros/livox_ros_driver2/msg/CustomMsg.js: /opt/ros/noetic/share/std_msgs/msg/Header.msg
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --blue --bold --progress-dir=/home/zgx/Desktop/HongTu/G1Nav2D/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Generating Javascript code from livox_ros_driver2/CustomMsg.msg"
 	cd /home/zgx/Desktop/HongTu/G1Nav2D/build/livox_ros_driver2 && ../catkin_generated/env_cached.sh /usr/bin/python3 /opt/ros/noetic/share/gennodejs/cmake/../../../lib/gennodejs/gen_nodejs.py /home/zgx/Desktop/HongTu/G1Nav2D/src/livox_ros_driver2/msg/CustomMsg.msg -Ilivox_ros_driver2:/home/zgx/Desktop/HongTu/G1Nav2D/src/livox_ros_driver2/msg -Istd_msgs:/opt/ros/noetic/share/std_msgs/cmake/../msg -p livox_ros_driver2 -o /home/zgx/Desktop/HongTu/G1Nav2D/devel/share/gennodejs/ros/livox_ros_driver2/msg
 

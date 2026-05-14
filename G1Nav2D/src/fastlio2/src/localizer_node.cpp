@@ -295,28 +295,27 @@ public:
         // === 重力对齐逆变换 ===
         Eigen::Matrix3d final_rot;
         if (lio_params_.align_gravity) {
-            // 1. 构造重力对齐后的旋转矩阵
-            Eigen::AngleAxisf rollAngle(roll, Eigen::Vector3f::UnitX());
-            Eigen::AngleAxisf pitchAngle(pitch, Eigen::Vector3f::UnitY());
-            Eigen::AngleAxisf yawAngle(yaw, Eigen::Vector3f::UnitZ());
-            Eigen::Matrix3d aligned_rot_matrix = (rollAngle * pitchAngle * yawAngle).toRotationMatrix().cast<double>();
-            
-            // 2. 计算重力对齐变换矩阵
-            Eigen::Vector3d from_vec = (-mean_acc).normalized();  // 使用实际的mean_acc
+            // 1. 计算重力对齐旋转：将当前IMU的实测重力方向对齐到(0,0,-1)
+            //    gravity_align_rot = 旋转矩阵 R 满足 R * (-mean_acc).normalized() = (0,0,-1)
+            //    即 gravity_align_rot 是 body→重力对齐世界(local帧) 的旋转
+            Eigen::Vector3d from_vec = (-mean_acc).normalized();
             Eigen::Vector3d to_vec(0.0, 0.0, -1.0);
-            
             Eigen::Matrix3d gravity_align_rot = rotationMatrixFromVectors(from_vec, to_vec);
-            
-            // 3. 逆向变换：original_rot = gravity_align_rot.T * aligned_rot
-            final_rot = gravity_align_rot.transpose() * aligned_rot_matrix;
-            
-            ROS_INFO("Gravity alignment applied using mean_acc: [%.3f, %.3f, %.3f]", 
-                    mean_acc[0], mean_acc[1], mean_acc[2]);
-            ROS_INFO("Aligned RPY: [%.3f, %.3f, %.3f]", roll, pitch, yaw);
-            
-            // 转换回欧拉角用于日志显示
-            Eigen::Vector3d original_rpy = final_rot.eulerAngles(0, 1, 2);
-            ROS_INFO("Original RPY: [%.3f, %.3f, %.3f]", original_rpy[0], original_rpy[1], original_rpy[2]);
+
+            // 2. 提取横滚/俯仰/偏航 (rotate2rpy分解: R = Rz(yaw)*Ry(pitch)*Rx(roll))
+            Eigen::Vector3d grav_rpy = rotate2rpy(gravity_align_rot);
+
+            // 3. 保留IMU实测的横滚和俯仰（机器人身体的真实倾斜），
+            //    但使用用户点击的偏航。构造的初始猜测 ≈ map_R_body
+            //    ICP内部候选位姿用 Rx(roll)*Ry(pitch)*Rz(yaw) 构建，
+            //    对于小角度横滚/俯仰，与 Rz(yaw)*Ry(pitch)*Rx(roll) 近似等价
+            Eigen::AngleAxisf rollAngle(grav_rpy(0), Eigen::Vector3f::UnitX());
+            Eigen::AngleAxisf pitchAngle(grav_rpy(1), Eigen::Vector3f::UnitY());
+            Eigen::AngleAxisf yawAngle(yaw, Eigen::Vector3f::UnitZ());
+            final_rot = (rollAngle * pitchAngle * yawAngle).toRotationMatrix().cast<double>();
+
+            ROS_INFO("Gravity alignment: grav_rpy=[%.3f, %.3f, %.3f], click_yaw=%.3f",
+                     grav_rpy[0], grav_rpy[1], grav_rpy[2], yaw);
         } else {
             // 不需要重力对齐逆变换
             Eigen::AngleAxisf rollAngle(roll, Eigen::Vector3f::UnitX());
@@ -324,7 +323,7 @@ public:
             Eigen::AngleAxisf yawAngle(yaw, Eigen::Vector3f::UnitZ());
             final_rot = (rollAngle * pitchAngle * yawAngle).toRotationMatrix().cast<double>();
         }
-        
+
         {
             std::lock_guard<std::mutex> lock(shared_date_->service_mutex);
             shared_date_->halt_flag = false;
