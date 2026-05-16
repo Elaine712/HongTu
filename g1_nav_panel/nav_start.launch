@@ -1,0 +1,45 @@
+<launch>
+    <!--
+    G1 Navigation Panel - 导航启动文件（带参数）
+    由 g1_nav_panel/main.py 调用，传递自定义地图路径
+    -->
+    <arg name="map_yaml" default="$(find fastlio)/../../G1map.yaml" />
+    <arg name="pcd_path" default="$(find fastlio)/PCD/map.pcd" />
+
+    <!-- TF: body → base_link -->
+    <node pkg="tf" type="static_transform_publisher" name="base_to_body"
+          args="0.0 0 0.0 3.1416 3.1416 0 /body /base_link 1" />
+
+    <!-- Livox 雷达驱动 -->
+    <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360.launch" />
+
+    <!-- FAST-LIO2 定位 + 加载配置 -->
+    <rosparam command="load" file="$(find fastlio)/config/localize.yaml" />
+    <!-- 覆盖 PCD 地图路径为选择的路径 -->
+    <param name="localizer/pcd_path" value="$(arg pcd_path)" />
+    <node pkg="fastlio" type="localizer_node" name="localizer_node" output="screen" />
+
+    <!-- 重定位脚本 -->
+    <node pkg="fastlio" type="slam_reloc.py" name="slam_reloc" output="screen">
+        <param name="pcd_path" value="$(arg pcd_path)" />
+    </node>
+
+    <!-- 2D 栅格地图服务器 -->
+    <node name="map_server" pkg="map_server" type="map_server" args="$(arg map_yaml)" output="screen" />
+
+    <!-- 点云降采样 -->
+    <include file="$(find tool)/launch/downsample_pointcloud.launch" />
+
+    <!-- move_base 导航栈 -->
+    <include file="$(find xju_pnc)/launch/move_base.launch" />
+
+    <!-- 点云转激光 -->
+    <include file="$(find pointcloud_to_laserscan)/launch/point_to_scan.launch" />
+
+    <!-- 点云坐标变换 -->
+    <include file="$(find tool)/launch/body2any_pointcloud.launch" />
+
+    <!-- 速度平滑 -->
+    <include file="$(find velocity_smoother_ema)/launch/velocity_smoother_ema.launch" />
+
+</launch>
