@@ -13,6 +13,8 @@ import json
 import math
 import os
 import signal
+import atexit
+import socket
 import subprocess
 import sys
 import threading
@@ -60,6 +62,26 @@ try:
 except Exception:
     G1_OK = False
     ARM_ACTIONS = {}
+
+# 英文动作名 → 中文显示名
+ACTION_CN = {
+    "face wave": "挥手",
+    "high wave": "高举挥手",
+    "clap": "鼓掌",
+    "hug": "拥抱",
+    "heart": "比心",
+    "right heart": "右手比心",
+    "reject": "拒绝",
+    "right hand up": "举右手",
+    "hands up": "双手举高",
+    "x-ray": "展示",
+    "shake hand": "握手",
+    "high five": "击掌",
+    "two-hand kiss": "双手飞吻",
+    "left kiss": "左手飞吻",
+    "right kiss": "右手飞吻",
+    "release arm": "释放手臂",
+}
 
 # ============================================================
 # 配置
@@ -116,8 +138,10 @@ class RosWorker(QThread):
     request_goal = pyqtSignal(float, float, float)    # x, y, yaw
     request_initpose = pyqtSignal(float, float, float)
     request_cmd_vel = pyqtSignal(float, float, float) # vx, vy, wz
-    # 从 ROS 线程发往主线程的导航速度
+    request_reloc = pyqtSignal(float, float, float)   # x, y, yaw → ICP 重定位
+    # 从 ROS 线程发往主线程的
     nav_cmd_vel = pyqtSignal(float, float, float)  # vx, vy, wz
+    reloc_done = pyqtSignal(bool, str)             # success, message
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -127,6 +151,9 @@ class RosWorker(QThread):
         self._pub_initpose = None
         self._pose = (0.0, 0.0, 0.0)
         self._shutdown = False
+        self._pcd_path = ""
+        self._goal_pending = False
+        self._goal_was_active = False
 
     def stop(self):
         self._shutdown = True
@@ -167,11 +194,33 @@ class RosWorker(QThread):
             self.request_cmd_vel.connect(self._pub_cmd_vel)
             self.request_goal.connect(self._pub_goal_slot)
             self.request_initpose.connect(self._pub_initpose_slot)
+            self.request_reloc.connect(self._do_reloc)
+
+            # TF 监听器（用于获取 map→base_link 位姿，包含 ICP 修正）
+            self._tf_buffer = tf2_ros.Buffer()
+            self._tf_listener = tf2_ros.TransformListener(self._tf_buffer)
+            # 静态 TF 发布：body → base_link（替代 base_to_body 节点）
+            self._static_br = tf2_ros.StaticTransformBroadcaster()
+            import geometry_msgs.msg
+            static_tf = geometry_msgs.msg.TransformStamped()
+            static_tf.header.stamp = rospy.Time.now()
+            static_tf.header.frame_id = "body"
+            static_tf.child_frame_id = "base_link"
+            static_tf.transform.rotation.x = 0.0
+            static_tf.transform.rotation.y = 0.0
+            static_tf.transform.rotation.z = 1.0
+            static_tf.transform.rotation.w = 0.0  # 180° around Z
+            self._static_br.sendTransform(static_tf)
+            self.log_msg.emit("[ROS] 发布静态 TF: body → base_link")
 
             rospy.Subscriber("/slam_odom", Odometry, self._odom_cb)
             rospy.Subscriber("/map", OccupancyGrid, self._map_cb)
             rospy.Subscriber("/move_base/status", GoalStatusArray, self._status_cb)
-            rospy.Subscriber("/cmd_vel", Twist, self._cmd_vel_bridge_cb)  # 导航→G1 桥接
+            rospy.Subscriber("/cmd_vel", Twist, self._cmd_vel_bridge_cb)
+
+            # 重定位服务延迟连接（导航启动后才可用）
+            self._reloc_srv = None
+
             self.log_msg.emit("[ROS] 节点已启动")
             self._running = True
             rospy.spin()
@@ -193,6 +242,8 @@ class RosWorker(QThread):
         g.pose.orientation.x, g.pose.orientation.y = q[0], q[1]
         g.pose.orientation.z, g.pose.orientation.w = q[2], q[3]
         self._pub_goal.publish(g)
+        self._goal_pending = True
+        self._goal_was_active = False  # 新目标，还没进入 active 状态  # 标记正在等待导航完成
         self.log_msg.emit(f"[ROS] 导航目标: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
 
     def _pub_initpose_slot(self, x, y, yaw):
@@ -206,10 +257,40 @@ class RosWorker(QThread):
         self._pub_initpose.publish(p)
         self.log_msg.emit(f"[ROS] 初始位姿: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
 
+    def _do_reloc(self, x, y, yaw):
+        """重定位：发布 /initialpose（和 RViz 2D Pose Estimate 一样）"""
+        try:
+            p = PoseWithCovarianceStamped()
+            p.header.frame_id = "map"
+            p.header.stamp = rospy.Time.now()
+            p.pose.pose.position.x = float(x)
+            p.pose.pose.position.y = float(y)
+            p.pose.pose.position.z = 0.0
+            q = tf_tr.quaternion_from_euler(0, 0, float(yaw))
+            p.pose.pose.orientation.x, p.pose.pose.orientation.y = q[0], q[1]
+            p.pose.pose.orientation.z, p.pose.pose.orientation.w = q[2], q[3]
+            self._pub_initpose.publish(p)
+            self.reloc_done.emit(True, f"已发送重定位: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
+            self.log_msg.emit(f"[重定位] 发布 initialpose: ({x:.2f}, {y:.2f}) 朝向 {math.degrees(yaw):.0f}°")
+        except Exception as e:
+            self.reloc_done.emit(False, str(e))
+            self.log_msg.emit(f"[重定位] 失败: {e}")
+
     def _odom_cb(self, msg):
+        """里程计回调：优先用 TF（含 ICP 修正），降级到 odometry"""
+        # 先用 odometry 兜底
         q = msg.pose.pose.orientation
         _, _, yaw = tf_tr.euler_from_quaternion([q.x, q.y, q.z, q.w])
         self._pose = (msg.pose.pose.position.x, msg.pose.pose.position.y, yaw)
+        # 非阻塞尝试 TF（ICP 重定位后 map→body 会更新）
+        try:
+            t = self._tf_buffer.lookup_transform("map", "body", rospy.Time(0))
+            tx, ty = t.transform.translation.x, t.transform.translation.y
+            tq = t.transform.rotation
+            _, _, tyaw = tf_tr.euler_from_quaternion([tq.x, tq.y, tq.z, tq.w])
+            self._pose = (tx, ty, tyaw)
+        except Exception:
+            pass  # TF 不可用，用 odometry
         self.pose_updated.emit(*self._pose)
 
     def _cmd_vel_bridge_cb(self, msg):
@@ -225,10 +306,17 @@ class RosWorker(QThread):
             s = msg.status_list[-1].status
             txt = NAV_STATUS_MAP.get(s, f"未知")
             self.nav_status_updated.emit(txt)
-            if s == 3:
-                self.goal_done.emit(True)
-            elif s in (2, 4, 5, 8):
-                self.goal_done.emit(False)
+            if self._goal_pending:
+                if s == 1:  # active — 确认 move_base 正在执行
+                    self._goal_was_active = True
+                if self._goal_was_active and s == 3:  # succeeded（必须先 active 过）
+                    self._goal_pending = False
+                    self._goal_was_active = False
+                    self.goal_done.emit(True)
+                elif s in (2, 4, 5, 8):  # failed/canceled
+                    self._goal_pending = False
+                    self._goal_was_active = False
+                    self.goal_done.emit(False)
         else:
             self.nav_status_updated.emit("空闲")
 
@@ -253,6 +341,7 @@ class MapView(QGraphicsView):
     """显示 2D 栅格地图，叠加机器人位置、航点"""
 
     clicked = pyqtSignal(float, float)  # 鼠标点击的地图坐标
+    pose_clicked = pyqtSignal(float, float, float)  # 拖拽重定位: x, y, yaw
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -262,7 +351,7 @@ class MapView(QGraphicsView):
         self.setDragMode(QGraphicsView.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
         self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
-        self.setBackgroundBrush(QBrush(QColor("#2b2b2b")))
+        self.setBackgroundBrush(QBrush(QColor("#0d1117")))
 
         self._map_item = None
         self._robot_item = None
@@ -272,6 +361,25 @@ class MapView(QGraphicsView):
         self._width = 0
         self._height = 0
         self._scale = 1.0
+
+        # 拖拽重定位状态
+        self._reloc_mode = False
+        self._drag_start_scene = None  # 拖拽起点（场景坐标）
+        self._drag_arrow = None  # 拖拽箭头
+
+    def set_reloc_mode(self, on):
+        self._reloc_mode = on
+        if on:
+            self.setDragMode(QGraphicsView.NoDrag)
+        else:
+            self.setDragMode(QGraphicsView.ScrollHandDrag)
+            self._clear_drag_arrow()
+
+    def _clear_drag_arrow(self):
+        if self._drag_arrow:
+            for item in self._drag_arrow:
+                self._scene.removeItem(item)
+            self._drag_arrow = None
 
     def set_map(self, occ_grid):
         """从 OccupancyGrid 更新地图显示"""
@@ -320,35 +428,67 @@ class MapView(QGraphicsView):
         self.fitInView(self._scene.itemsBoundingRect(), Qt.KeepAspectRatio)
 
     def update_robot(self, x, y, yaw):
-        """更新机器人位置"""
+        """更新机器人位置 — 三角箭头 + 发光效果"""
         if self._robot_item:
             self._scene.removeItem(self._robot_item)
             self._robot_item = None
-
-        # 如果地图还没加载，不显示
         if self._res <= 0:
             return
 
-        # 地图坐标 → 像素坐标
         px = (x - self._origin[0]) / self._res
         py = (y - self._origin[1]) / self._res
-
-        # 绘制机器人（圆 + 箭头）
         items = []
-        ell = self._scene.addEllipse(px - 6, py - 6, 12, 12,
-                                      QPen(Qt.white, 2), QBrush(QColor("#00aaff")))
-        items.append(ell)
-        # 箭头
-        arrow_len = 14
-        ax = px + arrow_len * math.cos(yaw)
-        ay = py + arrow_len * math.sin(yaw)
-        line = self._scene.addLine(px, py, ax, ay, QPen(Qt.white, 3))
-        items.append(line)
-        # 位置标签
-        label = self._scene.addText(f"({x:.1f},{y:.1f})", QFont("Arial", 8))
-        label.setPos(px + 10, py - 10)
-        label.setDefaultTextColor(QColor("#00aaff"))
+
+        # 外圈发光
+        glow = self._scene.addEllipse(px - 16, py - 16, 32, 32,
+                                       QPen(QColor("#e94560"), 1), QBrush(QColor(233, 69, 96, 40)))
+        items.append(glow)
+
+        # 三角箭头 — 指向朝向
+        size = 12
+        cos_y = math.cos(yaw)
+        sin_y = math.sin(yaw)
+        # 尖端
+        tip_x = px + size * 1.5 * cos_y
+        tip_y = py + size * 1.5 * sin_y
+        # 左翼
+        left_x = px + size * (-0.5 * cos_y - 0.8 * sin_y)
+        left_y = py + size * (-0.5 * sin_y + 0.8 * cos_y)
+        # 右翼
+        right_x = px + size * (-0.5 * cos_y + 0.8 * sin_y)
+        right_y = py + size * (-0.5 * sin_y - 0.8 * cos_y)
+        # 尾部
+        tail_x = px - size * 0.3 * cos_y
+        tail_y = py - size * 0.3 * sin_y
+
+        poly = QPolygonF([
+            QPointF(tip_x, tip_y),
+            QPointF(left_x, left_y),
+            QPointF(tail_x, tail_y),
+            QPointF(right_x, right_y),
+        ])
+        arrow = self._scene.addPolygon(poly,
+                                        QPen(QColor("#ffffff"), 2),
+                                        QBrush(QColor("#e94560")))
+        items.append(arrow)
+
+        # 中心点
+        center = self._scene.addEllipse(px - 3, py - 3, 6, 6,
+                                         QPen(Qt.NoPen), QBrush(QColor("#ffffff")))
+        items.append(center)
+
+        # 坐标标签（带背景）
+        txt = f"({x:.1f}, {y:.1f})"
+        label = self._scene.addText(txt, QFont("Arial", 9, QFont.Bold))
+        label.setPos(px + 18, py - 20)
+        label.setDefaultTextColor(QColor("#ffffff"))
+        # 标签背景
+        bg = self._scene.addRect(label.boundingRect().translated(px + 18, py - 20),
+                                  QPen(Qt.NoPen), QBrush(QColor(15, 52, 96, 200)))
+        items.append(bg)
         items.append(label)
+
+        self._robot_item = self._scene.createItemGroup(items)
         self._robot_item = self._scene.createItemGroup(items)
 
     def update_waypoints(self, wps):
@@ -368,12 +508,66 @@ class MapView(QGraphicsView):
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
-            # 视图坐标 → 场景坐标 → 地图坐标
             sp = self.mapToScene(e.pos())
-            mx = sp.x() * self._res + self._origin[0]
-            my = sp.y() * self._res + self._origin[1]
-            self.clicked.emit(mx, my)
+            if self._reloc_mode:
+                # 重定位模式：记录拖拽起点
+                self._drag_start_scene = sp
+                self._clear_drag_arrow()
+            else:
+                # 普通模式：点击发送导航目标
+                mx = sp.x() * self._res + self._origin[0]
+                my = sp.y() * self._res + self._origin[1]
+                self.clicked.emit(mx, my)
         super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._reloc_mode and self._drag_start_scene:
+            # 实时绘制拖拽箭头 + 更新机器人标记预览
+            self._clear_drag_arrow()
+            start = self._drag_start_scene
+            end = self.mapToScene(e.pos())
+            dx = end.x() - start.x()
+            dy = end.y() - start.y()
+            if abs(dx) > 2 or abs(dy) > 2:
+                items = []
+                # 箭头线
+                pen = QPen(QColor("#e94560"), 3)
+                line = self._scene.addLine(start.x(), start.y(), end.x(), end.y(), pen)
+                items.append(line)
+                # 起点圆
+                dot = self._scene.addEllipse(start.x() - 4, start.y() - 4, 8, 8,
+                                              QPen(QColor("#e94560"), 2), QBrush(QColor("#e94560")))
+                items.append(dot)
+                # 朝向文字
+                yaw = math.atan2(dy, dx)
+                yaw_deg = math.degrees(yaw)
+                label = self._scene.addText(f"{yaw_deg:.0f}°", QFont("Arial", 10, QFont.Bold))
+                label.setPos(end.x() + 5, end.y() - 15)
+                label.setDefaultTextColor(QColor("#e94560"))
+                items.append(label)
+                self._drag_arrow = items
+
+                # 实时更新机器人预览位置
+                mx = start.x() * self._res + self._origin[0]
+                my = start.y() * self._res + self._origin[1]
+                self.update_robot(mx, my, yaw)
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._reloc_mode and self._drag_start_scene and e.button() == Qt.LeftButton:
+            end = self.mapToScene(e.pos())
+            start = self._drag_start_scene
+            dx = end.x() - start.x()
+            dy = end.y() - start.y()
+            # 起点 = 机器人位置（地图坐标）
+            mx = start.x() * self._res + self._origin[0]
+            my = start.y() * self._res + self._origin[1]
+            # 拖拽方向 = 机器人朝向
+            yaw = math.atan2(dy, dx) if (abs(dx) > 2 or abs(dy) > 2) else 0.0
+            self._drag_start_scene = None
+            self._clear_drag_arrow()
+            self.pose_clicked.emit(mx, my, yaw)
+        super().mouseReleaseEvent(e)
 
     def wheelEvent(self, e):
         factor = 1.15 if e.angleDelta().y() > 0 else 0.85
@@ -395,10 +589,16 @@ class WaypointDialog(QDialog):
         self._yaw = QLineEdit(f"{math.degrees(yaw):.1f}")
         self._action = QComboBox()
         self._action.addItem("无")
+        self._act_en_to_cn = {}
+        self._act_cn_to_en = {}
         for a in sorted(ARM_ACTIONS.keys()):
-            self._action.addItem(a)
+            cn = ACTION_CN.get(a, a.replace("_", " "))
+            self._act_en_to_cn[a] = cn
+            self._act_cn_to_en[cn] = a
+            self._action.addItem(cn)
         if action:
-            idx = self._action.findText(action)
+            cn = self._act_en_to_cn.get(action, action)
+            idx = self._action.findText(cn)
             if idx >= 0:
                 self._action.setCurrentIndex(idx)
         self._speech = QLineEdit(speech)
@@ -425,7 +625,8 @@ class WaypointDialog(QDialog):
             self._x_val = float(self._x.text())
             self._y_val = float(self._y.text())
             self._yaw_val = math.radians(float(self._yaw.text()))
-            self._act_val = self._action.currentText() if self._action.currentText() != "无" else ""
+            act_cn = self._action.currentText()
+            self._act_val = self._act_cn_to_en.get(act_cn, "") if act_cn != "无" else ""
             self._sp_val = self._speech.text().strip()
             self.accept()
         except ValueError:
@@ -452,6 +653,7 @@ class MainWindow(QMainWindow):
         self._g1_audio = None
         self._g1_ready = False
         self._teleop_active = False
+        self._has_active_goal = False  # 是否有活跃的导航目标，防止启动时误触发
         self._waypoints = []  # [(name, x, y, yaw, action, speech)]
         self._tour_running = False
         self._last_pose = (0.0, 0.0, 0.0)
@@ -470,30 +672,63 @@ class MainWindow(QMainWindow):
         self.resize(1300, 850)
         self.setMinimumSize(900, 600)
 
-        # 暗色主题
+        # 暗色主题 - 现代化配色
         self.setStyleSheet("""
-            QMainWindow, QDialog, QWidget { background: #1e1e1e; color: #ddd; }
-            QTabWidget::pane { border: 1px solid #444; background: #252526; }
-            QTabBar::tab { background: #2d2d2d; color: #aaa; padding: 8px 18px; margin-right: 2px; }
-            QTabBar::tab:selected { background: #007acc; color: #fff; }
-            QGroupBox { border: 1px solid #444; border-radius: 4px; margin-top: 12px; padding-top: 12px; color: #ccc; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; }
-            QPushButton { background: #007acc; color: #fff; border: none; padding: 6px 14px; border-radius: 3px; }
-            QPushButton:hover { background: #0098ff; }
-            QPushButton:pressed { background: #005a99; }
-            QPushButton.danger { background: #c0392b; }
-            QPushButton.danger:hover { background: #e74c3c; }
-            QPushButton.success { background: #27ae60; }
-            QPushButton.success:hover { background: #2ecc71; }
-            QPushButton.warning { background: #f39c12; color: #222; }
-            QLineEdit, QComboBox, QSpinBox { background: #3c3c3c; color: #ddd; border: 1px solid #555; padding: 4px; border-radius: 2px; }
-            QLabel { color: #ccc; }
-            QPlainTextEdit, QListWidget { background: #1e1e1e; color: #ccc; border: 1px solid #444; }
-            QProgressBar { background: #333; border: none; border-radius: 3px; text-align: center; }
-            QProgressBar::chunk { background: #007acc; border-radius: 3px; }
-            QSplitter::handle { background: #444; width: 2px; }
-            QCheckBox { color: #ccc; }
-            QStatusBar { background: #007acc; color: #fff; }
+            QMainWindow, QDialog { background: #1a1a2e; color: #e0e0e0; }
+            QWidget { background: transparent; color: #e0e0e0; }
+            QTabWidget::pane { border: 1px solid #3a3a5c; background: #16213e; border-radius: 4px; }
+            QTabBar::tab {
+                background: #1a1a2e; color: #8888aa; padding: 10px 22px;
+                margin-right: 2px; border-top-left-radius: 4px; border-top-right-radius: 4px;
+                font-size: 13px; font-weight: bold;
+            }
+            QTabBar::tab:selected { background: #0f3460; color: #e94560; }
+            QTabBar::tab:hover:!selected { background: #2a2a4a; color: #ccc; }
+            QGroupBox {
+                border: 1px solid #3a3a5c; border-radius: 6px;
+                margin-top: 14px; padding-top: 14px; color: #aaa;
+                font-size: 11px; font-weight: bold;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 4px; color: #e94560; }
+            QPushButton {
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #16213e,stop:1 #0f3460);
+                color: #e0e0e0; border: 1px solid #3a3a5c; padding: 7px 16px;
+                border-radius: 4px; font-size: 12px;
+            }
+            QPushButton:hover { background: #1a4080; border: 1px solid #e94560; }
+            QPushButton:pressed { background: #0a2040; }
+            QPushButton[class="success"] {
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #27ae60,stop:1 #1e8449);
+                border: 1px solid #2ecc71; color: #fff; font-weight: bold;
+            }
+            QPushButton[class="success"]:hover { background: #2ecc71; }
+            QPushButton[class="danger"] {
+                background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #c0392b,stop:1 #96281b);
+                border: 1px solid #e74c3c; color: #fff; font-weight: bold;
+            }
+            QPushButton[class="danger"]:hover { background: #e74c3c; }
+            QLineEdit, QComboBox, QSpinBox {
+                background: #1a1a2e; color: #e0e0e0;
+                border: 1px solid #3a3a5c; padding: 5px; border-radius: 4px; font-size: 12px;
+            }
+            QLineEdit:focus { border: 1px solid #e94560; }
+            QComboBox::drop-down { border: none; padding-right: 8px; }
+            QComboBox QAbstractItemView { background: #1a1a2e; color: #e0e0e0; selection-background-color: #0f3460; }
+            QLabel { color: #c0c0d0; font-size: 12px; }
+            QPlainTextEdit, QListWidget {
+                background: #0d1117; color: #c0c0d0;
+                border: 1px solid #3a3a5c; border-radius: 4px; font-size: 12px;
+            }
+            QProgressBar { background: #1a1a2e; border: none; border-radius: 4px; text-align: center; color: #fff; font-size: 11px; }
+            QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #e94560,stop:1 #0f3460); border-radius: 4px; }
+            QSplitter::handle { background: #3a3a5c; width: 2px; }
+            QCheckBox { color: #c0c0d0; spacing: 6px; }
+            QCheckBox::indicator { width: 16px; height: 16px; }
+            QStatusBar { background: #0f3460; color: #c0c0d0; font-size: 12px; border-top: 1px solid #3a3a5c; }
+            QScrollArea { border: none; }
+            QSlider::groove:horizontal { background: #3a3a5c; height: 6px; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #e94560; width: 14px; margin: -4px 0; border-radius: 7px; }
+            QSlider::sub-page:horizontal { background: #0f3460; border-radius: 3px; }
         """)
 
         central = QWidget()
@@ -522,9 +757,10 @@ class MainWindow(QMainWindow):
 
         # 工作流程指引
         self._step_label = QLabel(
-            "① 启动导航  →  ② 设置重定位（2D Pose Estimate）  →  ③ 点击地图或航点发送导航目标")
+            "① 启动导航  →  ② 点击地图设置重定位  →  ③ 发送导航目标")
         self._step_label.setStyleSheet(
-            "background: #2d2d2d; color: #f39c12; padding: 6px 12px; border-radius: 3px; font-size: 12px;")
+            "background: #16213e; color: #e94560; padding: 8px 14px; border-radius: 4px; "
+            "font-size: 13px; font-weight: bold; border: 1px solid #3a3a5c;")
         main_layout.addWidget(self._step_label)
 
         # 标签页
@@ -553,6 +789,7 @@ class MainWindow(QMainWindow):
 
         # 左侧：地图
         self._map_view = MapView()
+        self._map_view.clicked.connect(self._on_map_nav)  # 点击地图发送导航目标
         layout.addWidget(self._map_view, 3)
 
         # 右侧：可滚动的控制面板
@@ -598,22 +835,45 @@ class MainWindow(QMainWindow):
         grp = QGroupBox("重定位")
         grp.setFont(title_font)
         rl = QVBoxLayout(grp)
-        self._btn_reloc = QPushButton("📌 2D Pose Estimate (点击地图设置)")
+        self._btn_reloc = QPushButton("📌 点击地图重定位（ICP 自动对齐）")
         self._btn_reloc.clicked.connect(self._on_reloc_mode)
         rl.addWidget(self._btn_reloc)
 
-        # 使用当前朝向重定位
+        # 朝向控制 — 带指南针标注
+        yaw_row = QHBoxLayout()
+        yaw_row.addWidget(QLabel("朝向:"))
+        self._reloc_yaw_slider = QSlider(Qt.Horizontal)
+        self._reloc_yaw_slider.setRange(-180, 180)
+        self._reloc_yaw_slider.setValue(0)
+        self._reloc_yaw_slider.setTickInterval(45)
+        self._reloc_yaw_slider.setTickPosition(QSlider.TicksBelow)
+        self._reloc_yaw_label = QLabel("→ 0° (右)")
+        self._reloc_yaw_slider.valueChanged.connect(self._update_yaw_label)
+        yaw_row.addWidget(self._reloc_yaw_slider, 1)
+        yaw_row.addWidget(self._reloc_yaw_label)
+        rl.addLayout(yaw_row)
+
+        # 指南针图例
+        compass = QLabel("   0°→右   90°↓前   ±180°←后   -90°↑左")
+        compass.setStyleSheet("color: #888; font-size: 11px; padding: 2px 4px;")
+        rl.addWidget(compass)
+
+        hint = QLabel("提示: 在地图上点击机器人位置，ICP 会自动对齐 ±3m 范围")
+        hint.setStyleSheet("color: #e94560; font-size: 11px;")
+        hint.setWordWrap(True)
+        rl.addWidget(hint)
+
+        # 手动输入
         rl2 = QHBoxLayout()
-        rl2.addWidget(QLabel("x:"))
+        rl2.addWidget(QLabel("X:"))
         self._reloc_x = QLineEdit("0.0")
         self._reloc_x.setFixedWidth(70)
         rl2.addWidget(self._reloc_x)
-        rl2.addWidget(QLabel("y:"))
+        rl2.addWidget(QLabel("Y:"))
         self._reloc_y = QLineEdit("0.0")
         self._reloc_y.setFixedWidth(70)
         rl2.addWidget(self._reloc_y)
-        rl2.addWidget(QLabel("朝向:自动"))
-        btn_reloc_go = QPushButton("设置位姿")
+        btn_reloc_go = QPushButton("重定位到此坐标")
         btn_reloc_go.clicked.connect(self._on_reloc_set)
         rl2.addWidget(btn_reloc_go)
         rl.addLayout(rl2)
@@ -650,10 +910,10 @@ class MainWindow(QMainWindow):
         # 快速动作
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("手臂:"))
-        for atxt in ["挥手", "鼓掌", "比心", "握手", "拒绝"]:
-            an = {"挥手": "face wave", "鼓掌": "clap", "比心": "heart",
-                  "握手": "shake hand", "拒绝": "reject"}[atxt]
-            btn = QPushButton(atxt)
+        quick_acts = [("挥手", "face wave"), ("鼓掌", "clap"), ("比心", "heart"),
+                       ("握手", "shake hand"), ("拒绝", "reject")]
+        for cn_name, an in quick_acts:
+            btn = QPushButton(cn_name)
             btn.setFixedWidth(56)
             btn.setMinimumHeight(28)
             btn.clicked.connect(lambda checked, n=an: self._g1_arm_action(n))
@@ -666,11 +926,15 @@ class MainWindow(QMainWindow):
         row3.addWidget(QLabel("语音:"))
         self._nav_tts = QLineEdit()
         self._nav_tts.setPlaceholderText("输入播报文字…")
-        self._nav_tts.setMinimumHeight(28)
+        self._nav_tts.setMinimumHeight(30)
         self._nav_tts.returnPressed.connect(self._on_nav_tts)
         row3.addWidget(self._nav_tts, 1)
         btn_say = QPushButton("播报")
-        btn_say.setMinimumHeight(28)
+        btn_say.setMinimumHeight(30)
+        btn_say.setStyleSheet("""
+            QPushButton { background: #e94560; color: #fff; font-weight: bold; border-radius: 4px; }
+            QPushButton:hover { background: #ff6b81; }
+        """)
         btn_say.clicked.connect(self._on_nav_tts)
         row3.addWidget(btn_say)
         gg.addLayout(row3)
@@ -757,13 +1021,13 @@ class MainWindow(QMainWindow):
         btn_lat_left = make_btn("←横\nQ", vy=1)
         btn_lat_right = make_btn("→横\nE", vy=-1)
 
-        grid.addWidget(btn_fwd, 0, 1)
+        grid.addWidget(btn_fwd, 0, 2)
         grid.addWidget(btn_lat_left, 1, 0)
         grid.addWidget(btn_left, 1, 1)
         grid.addWidget(btn_stop, 1, 2)
         grid.addWidget(btn_right, 1, 3)
         grid.addWidget(btn_lat_right, 1, 4)
-        grid.addWidget(btn_bwd, 2, 1)
+        grid.addWidget(btn_bwd, 2, 2)
         dl.addLayout(grid)
 
         hint = QLabel("键盘: W↑ S↓ A← D→ Q左横移 E右横移 空格急停")
@@ -776,6 +1040,13 @@ class MainWindow(QMainWindow):
         estop.setStyleSheet("font-size: 16px; font-weight: bold; background: #c0392b; color: #fff; padding: 12px;")
         estop.clicked.connect(self._emergency_stop)
         layout.addWidget(estop)
+
+        estop_hint = QLabel(
+            "⚠ 急停 = 发送零速度指令（机器人原地站定，不会摔倒）\n"
+            "   不会进入阻尼/零力矩模式，安全可靠")
+        estop_hint.setStyleSheet("color: #888; font-size: 11px; padding: 4px 8px;")
+        estop_hint.setWordWrap(True)
+        layout.addWidget(estop_hint)
 
         return tab
 
@@ -855,9 +1126,11 @@ class MainWindow(QMainWindow):
         # 手臂动作
         grp = QGroupBox("手臂预设动作")
         gl = QHBoxLayout(grp)
-        common = ["face wave", "clap", "hug", "heart", "right hand up", "reject", "shake hand", "x-ray", "high five"]
-        for aname in common:
-            btn = QPushButton(aname.replace("_", " ").title())
+        common = [("face wave", "挥手"), ("clap", "鼓掌"), ("hug", "拥抱"),
+                   ("heart", "比心"), ("right hand up", "举手"), ("reject", "拒绝"),
+                   ("shake hand", "握手"), ("x-ray", "展示"), ("high five", "击掌")]
+        for aname, cn in common:
+            btn = QPushButton(cn)
             btn.clicked.connect(lambda checked, n=aname: self._g1_arm_action(n))
             gl.addWidget(btn)
         gl.addStretch()
@@ -871,8 +1144,9 @@ class MainWindow(QMainWindow):
         sw = QWidget()
         fl = QHBoxLayout(sw)
         for aname in sorted(ARM_ACTIONS.keys()):
-            btn = QPushButton(aname.replace("_", " ").title())
-            btn.setFixedWidth(100)
+            cn = ACTION_CN.get(aname, aname.replace("_", " "))
+            btn = QPushButton(cn)
+            btn.setFixedWidth(80)
             btn.clicked.connect(lambda checked, n=aname: self._g1_arm_action(n))
             fl.addWidget(btn)
         fl.addStretch()
@@ -886,9 +1160,15 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         self._tts_input = QLineEdit()
         self._tts_input.setPlaceholderText("输入播报文字…")
+        self._tts_input.setMinimumHeight(30)
         self._tts_input.returnPressed.connect(self._on_tts)
         row.addWidget(self._tts_input, 1)
-        btn_tts = QPushButton("🔊 播报")
+        btn_tts = QPushButton("播报")
+        btn_tts.setMinimumHeight(30)
+        btn_tts.setStyleSheet("""
+            QPushButton { background: #e94560; color: #fff; font-weight: bold; border-radius: 4px; }
+            QPushButton:hover { background: #ff6b81; }
+        """)
         btn_tts.clicked.connect(self._on_tts)
         row.addWidget(btn_tts)
         gl.addLayout(row)
@@ -898,6 +1178,10 @@ class MainWindow(QMainWindow):
         for phrase in ["欢迎参观", "请跟我来", "这是我们的展品", "谢谢大家",
                         "请注意安全", "正在前往下一个展品"]:
             btn = QPushButton(phrase)
+            btn.setStyleSheet("""
+                QPushButton { background: #16213e; border: 1px solid #3a3a5c; border-radius: 4px; }
+                QPushButton:hover { background: #0f3460; border: 1px solid #e94560; }
+            """)
             btn.clicked.connect(lambda checked, p=phrase: self._g1_speak(p))
             phrases_row.addWidget(btn)
         phrases_row.addStretch()
@@ -908,10 +1192,25 @@ class MainWindow(QMainWindow):
         grp = QGroupBox("LED & 音量")
         gl = QHBoxLayout(grp)
         gl.addWidget(QLabel("LED:"))
-        for txt, r, g, b in [("红", 255, 0, 0), ("绿", 0, 255, 0), ("蓝", 0, 0, 255),
-                              ("白", 255, 255, 255), ("关", 0, 0, 0)]:
+        led_colors = [
+            ("红", 255, 0, 0, "#ff3333", "#fff"),
+            ("绿", 0, 255, 0, "#33cc33", "#fff"),
+            ("蓝", 0, 0, 255, "#3366ff", "#fff"),
+            ("白", 255, 255, 255, "#ffffff", "#333"),
+            ("关", 0, 0, 0, "#555555", "#aaa"),
+        ]
+        for txt, r, g, b, bg, fg in led_colors:
             btn = QPushButton(txt)
-            btn.setFixedWidth(32)
+            btn.setFixedSize(48, 32)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {bg}; color: {fg};
+                    border: 2px solid #3a3a5c; border-radius: 6px;
+                    font-weight: bold; font-size: 12px;
+                }}
+                QPushButton:hover {{ border: 2px solid #e94560; background: {bg}; }}
+                QPushButton:pressed {{ background: {bg}; border: 2px solid #fff; }}
+            """)
             btn.clicked.connect(lambda checked, rr=r, gg=g, bb=b: self._g1_api(
                 lambda: self._g1_audio.LedControl(rr, gg, bb)))
             gl.addWidget(btn)
@@ -994,6 +1293,8 @@ class MainWindow(QMainWindow):
         self._ros_worker.goal_done.connect(self._on_goal_done)
         self._ros_worker.log_msg.connect(self._log)
         self._ros_worker.nav_cmd_vel.connect(self._on_nav_cmd_vel)
+        self._ros_worker.reloc_done.connect(self._on_reloc_done)
+        self._ros_worker._pcd_path = self._edit_pcd.text().strip()
         self._ros_worker.start()
         self._status_ros.setText("ROS: 已连接")
 
@@ -1012,6 +1313,9 @@ class MainWindow(QMainWindow):
         self.cfg["map_yaml"] = map_yaml
         self.cfg["pcd_path"] = pcd_path
         save_config(self.cfg)
+        # 更新 ROS worker 的 PCD 路径（用于重定位服务）
+        if self._ros_worker:
+            self._ros_worker._pcd_path = pcd_path
 
         # 找到 launch 文件
         launch_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nav_start.launch")
@@ -1100,6 +1404,8 @@ class MainWindow(QMainWindow):
             self._g1_loco.SetTimeout(10.0)
             self._g1_loco.Init()
             self._g1_loco.Start()
+            global _g1_loco_ref
+            _g1_loco_ref = self._g1_loco
 
             self._g1_arm = G1ArmActionClient()
             self._g1_arm.SetTimeout(10.0)
@@ -1150,56 +1456,123 @@ class MainWindow(QMainWindow):
         self._nav_state_label.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {color};")
 
     def _on_goal_done(self, success):
+        self._has_active_goal = False
         if self._tour_running:
             self._tour_next_step()
 
     def _on_nav_cmd_vel(self, vx, vy, wz):
-        """将 move_base 的 cmd_vel 转发给 G1"""
-        if self._g1_ready and self._g1_loco:
-            try:
-                if abs(vx) < 0.001 and abs(vy) < 0.001 and abs(wz) < 0.001:
-                    self._g1_loco.StopMove()
-                else:
-                    self._g1_loco.Move(vx, vy, wz, continous_move=True)
-            except Exception:
-                pass
+        """将 move_base 的 cmd_vel 转发给 G1（仅在有活跃目标时）"""
+        if not self._g1_ready or not self._g1_loco:
+            return
+        if not self._has_active_goal:
+            return  # 没有导航目标时不转发，防止启动时误触发
+        try:
+            if abs(vx) < 0.001 and abs(vy) < 0.001 and abs(wz) < 0.001:
+                self._g1_loco.StopMove()
+            else:
+                self._g1_loco.Move(vx, vy, wz, continous_move=True)
+        except Exception:
+            pass
 
     # ---- 重定位 ----
     _reloc_mode = False
 
+    def _update_yaw_label(self, v):
+        """更新朝向标签，显示指南针方向"""
+        if v >= -23 and v <= 23:
+            self._reloc_yaw_label.setText(f"→ {v}° (右)")
+        elif v > 23 and v <= 68:
+            self._reloc_yaw_label.setText(f"↘ {v}° (右下)")
+        elif v > 68 and v <= 113:
+            self._reloc_yaw_label.setText(f"↓ {v}° (前)")
+        elif v > 113 and v <= 158:
+            self._reloc_yaw_label.setText(f"↙ {v}° (左下)")
+        elif v > 158 or v < -158:
+            self._reloc_yaw_label.setText(f"← {v}° (后)")
+        elif v >= -158 and v < -113:
+            self._reloc_yaw_label.setText(f"↖ {v}° (左上)")
+        elif v >= -113 and v < -68:
+            self._reloc_yaw_label.setText(f"↑ {v}° (左)")
+        elif v >= -68 and v < -23:
+            self._reloc_yaw_label.setText(f"↗ {v}° (右上)")
+
     def _on_reloc_mode(self):
         self._reloc_mode = not self._reloc_mode
+        self._map_view.set_reloc_mode(self._reloc_mode)
         if self._reloc_mode:
-            self._btn_reloc.setText("✅ 点击地图 → 设置初始位姿")
+            self._btn_reloc.setText("✅ 重定位模式 — 拖拽设置位置+朝向")
             self._btn_reloc.setStyleSheet("background: #27ae60; color: #fff; font-weight: bold;")
-            self._step_label.setText("📍 重定位模式: 在地图上点击机器人实际位置 → 自动设置朝向")
-            self._step_label.setStyleSheet("background: #2d2d2d; color: #27ae60; padding: 6px 12px; border-radius: 3px; font-size: 12px; font-weight: bold;")
-            self._map_view.clicked.connect(self._on_map_click_reloc)
+            self._step_label.setText("📍 重定位: 在地图上按住拖拽 → 起点=位置，方向=朝向，松开自动 ICP 对齐")
+            self._step_label.setStyleSheet(
+                "background: #16213e; color: #27ae60; padding: 8px 14px; border-radius: 4px; "
+                "font-size: 13px; font-weight: bold; border: 1px solid #3a3a5c;")
+            self._map_view.pose_clicked.connect(self._on_drag_reloc)
         else:
-            self._btn_reloc.setText("📌 2D Pose Estimate (点击地图设置)")
+            self._btn_reloc.setText("📌 点击地图重定位（ICP 自动对齐）")
             self._btn_reloc.setStyleSheet("")
-            self._step_label.setText("① 启动导航  →  ② 设置重定位  →  ③ 点击地图或航点发送导航目标")
-            self._step_label.setStyleSheet("background: #2d2d2d; color: #f39c12; padding: 6px 12px; border-radius: 3px; font-size: 12px;")
+            self._step_label.setText("① 启动导航  →  ② 拖拽地图设置重定位  →  ③ 发送导航目标")
+            self._step_label.setStyleSheet(
+                "background: #16213e; color: #e94560; padding: 8px 14px; border-radius: 4px; "
+                "font-size: 13px; font-weight: bold; border: 1px solid #3a3a5c;")
             try:
-                self._map_view.clicked.disconnect(self._on_map_click_reloc)
+                self._map_view.pose_clicked.disconnect(self._on_drag_reloc)
             except Exception:
                 pass
 
-    def _on_map_click_reloc(self, mx, my):
+    def _on_map_nav(self, mx, my):
+        """点击地图普通模式 → 发送导航目标"""
         _, _, yaw = self._last_pose
+        if self._ros_worker:
+            self._has_active_goal = True
+            self._ros_worker.send_goal(mx, my, yaw)
+            self._log(f"[导航] 点击目标: ({mx:.2f}, {my:.2f})")
+
+    def _on_drag_reloc(self, mx, my, yaw):
+        """拖拽重定位：起点=位置，方向=朝向，自动调 ICP"""
         self._reloc_x.setText(f"{mx:.2f}")
         self._reloc_y.setText(f"{my:.2f}")
-        self._on_reloc_set()
-        self._log(f"[重定位] 设置位姿: ({mx:.2f}, {my:.2f}) 朝向: {math.degrees(yaw):.1f}°")
+        self._reloc_yaw_slider.setValue(int(math.degrees(yaw)))
+        if self._ros_worker and self._ros_worker._reloc_srv:
+            self._ros_worker.request_reloc.emit(mx, my, yaw)
+            self._log(f"[重定位] 拖拽 ICP: ({mx:.2f}, {my:.2f}) 朝向: {math.degrees(yaw):.0f}°")
+        elif self._ros_worker:
+            self._ros_worker.send_init_pose(mx, my, yaw)
+            self._log(f"[重定位] 设置位姿: ({mx:.2f}, {my:.2f}) {math.degrees(yaw):.0f}°")
+
+    def _on_map_click_reloc(self, mx, my):
+        """点击地图重定位（非拖拽模式降级）"""
+        yaw = math.radians(self._reloc_yaw_slider.value())
+        self._reloc_x.setText(f"{mx:.2f}")
+        self._reloc_y.setText(f"{my:.2f}")
+        # 调用 ICP 重定位服务
+        if self._ros_worker and self._ros_worker._reloc_srv:
+            self._ros_worker.request_reloc.emit(mx, my, yaw)
+            self._log(f"[重定位] ICP 重定位: ({mx:.2f}, {my:.2f}) 朝向: {self._reloc_yaw_slider.value()}°")
+        else:
+            # 降级：只发初始位姿
+            self._on_reloc_set()
+            self._log(f"[重定位] 设置位姿: ({mx:.2f}, {my:.2f})")
+
+    def _on_reloc_done(self, success, msg):
+        if success:
+            self._log(f"[重定位] ✓ 成功: {msg}")
+        else:
+            self._log(f"[重定位] ✗ 失败: {msg}")
 
     def _on_reloc_set(self):
+        """手动输入坐标 → 调用 ICP 重定位服务"""
         try:
             x = float(self._reloc_x.text())
             y = float(self._reloc_y.text())
-            _, _, yaw = self._last_pose
-            if self._ros_worker:
+            yaw = math.radians(self._reloc_yaw_slider.value())
+            # 优先调用 ICP 服务（自动对齐点云）
+            if self._ros_worker and self._ros_worker._reloc_srv:
+                self._ros_worker.request_reloc.emit(x, y, yaw)
+                self._log(f"[重定位] ICP 重定位: ({x:.2f}, {y:.2f}) 朝向: {self._reloc_yaw_slider.value()}°")
+            elif self._ros_worker:
+                # 降级：只发初始位姿
                 self._ros_worker.send_init_pose(x, y, yaw)
-                self._log(f"[重定位] 发布初始位姿: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.1f}°)")
+                self._log(f"[重定位] 设置位姿（无 ICP）: ({x:.2f}, {y:.2f}) {self._reloc_yaw_slider.value()}°")
         except ValueError:
             QMessageBox.warning(self, "输入错误", "坐标格式错误")
 
@@ -1242,7 +1615,7 @@ class MainWindow(QMainWindow):
     def _g1_move(self, vx, vy, wz):
         if self._g1_ready:
             try:
-                self._g1_loco.Move(vx, vy, wz, continous_move=True)
+                self._g1_loco.Move(vx, vy, wz, continous_move=False)
             except Exception:
                 pass
 
@@ -1265,7 +1638,7 @@ class MainWindow(QMainWindow):
         if self._g1_ready and text.strip():
             try:
                 self._log(f"[语音] 播报: {text}")
-                self._g1_audio.TtsMaker(text.strip(), 0)
+                self._g1_audio.TtsMaker(text.strip(), 0) #0女声 1男声
             except Exception as e:
                 self._log(f"[语音] 失败: {e}")
 
@@ -1306,46 +1679,64 @@ class MainWindow(QMainWindow):
             return
         _, x, y, yaw, _, _ = self._waypoints[row]
         if self._ros_worker:
+            self._has_active_goal = True
             self._ros_worker.send_goal(x, y, yaw)
         self._log(f"[导航] 发送目标: ({x:.2f}, {y:.2f})")
 
     def _wp_save(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "保存航点", os.path.expanduser("~"), "JSON (*.json)")
+            self, "保存航点", os.path.expanduser("~/g1_waypoints.json"),
+            "JSON (*.json);;文本 (*.txt);;所有文件 (*)")
         if not path:
             return
+        if not path.endswith(('.json', '.txt')):
+            path += '.json'
         data = [{"name": n, "x": x, "y": y, "yaw": yaw, "action": a, "speech": s}
                 for n, x, y, yaw, a, s in self._waypoints]
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            self._log(f"[航点] 已保存 {len(data)} 个航点")
+            self._log(f"[航点] 已保存 {len(data)} 个航点: {os.path.basename(path)}")
         except Exception as e:
             QMessageBox.warning(self, "保存失败", str(e))
 
     def _wp_load(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "加载航点", os.path.expanduser("~"), "JSON (*.json)")
+            self, "加载航点", os.path.expanduser("~"),
+            "航点文件 (*.json *.txt);;JSON (*.json);;文本 (*.txt);;所有文件 (*)")
         if not path:
             return
         try:
             with open(path, encoding="utf-8") as f:
-                data = json.load(f)
+                content = f.read().strip()
+            if not content:
+                QMessageBox.warning(self, "加载失败", f"文件为空: {os.path.basename(path)}")
+                return
+            data = json.loads(content)
+            if not isinstance(data, list):
+                QMessageBox.warning(self, "加载失败", "文件格式错误：应为 JSON 数组")
+                return
             self._waypoints = [(d["name"], d["x"], d["y"], d["yaw"],
                                 d.get("action", ""), d.get("speech", "")) for d in data]
             self._wp_refresh()
-            self._log(f"[航点] 加载了 {len(self._waypoints)} 个航点")
+            self._log(f"[航点] 加载了 {len(self._waypoints)} 个航点: {os.path.basename(path)}")
+        except json.JSONDecodeError as e:
+            QMessageBox.warning(self, "加载失败",
+                                f"JSON 格式错误: {e}\n\n请确认文件是由「保存航点」生成的")
+        except KeyError as e:
+            QMessageBox.warning(self, "加载失败", f"缺少字段: {e}")
         except Exception as e:
             QMessageBox.warning(self, "加载失败", str(e))
 
     def _wp_refresh(self):
         self._wp_list.clear()
         for i, (name, x, y, yaw, action, speech) in enumerate(self._waypoints):
+            cn_act = ACTION_CN.get(action, action) if action else ""
             txt = f"{i+1}. {name}  ({x:.1f}, {y:.1f}) {math.degrees(yaw):.0f}°"
-            if action:
-                txt += f"  [动作: {action}]"
+            if cn_act:
+                txt += f"  [{cn_act}]"
             if speech:
-                txt += f"  [语音: {speech}]"
+                txt += f"  「{speech}」"
             self._wp_list.addItem(txt)
         self._map_view.update_waypoints(self._waypoints)
 
@@ -1369,6 +1760,7 @@ class MainWindow(QMainWindow):
         self._tour_label.setText(f"→ {name}")
         self._log(f"[巡航] [1/{len(self._waypoints)}] {name}")
         if self._ros_worker:
+            self._has_active_goal = True
             self._ros_worker.send_goal(x, y, yaw)
 
     def _tour_next_step(self):
@@ -1399,6 +1791,7 @@ class MainWindow(QMainWindow):
         self._log(f"[巡航] [{self._tour_idx + 1}/{len(self._waypoints)}] {name}")
 
         if self._ros_worker:
+            self._has_active_goal = True
             self._ros_worker.send_goal(x, y, yaw)
 
         self._tour_idx += 1
@@ -1442,6 +1835,14 @@ class MainWindow(QMainWindow):
             self._edit_net.setText(self.cfg["net_if"])
 
     def closeEvent(self, e):
+        # 紧急停止机器人
+        self._emergency_stop()
+        # 发送多次停止命令确保生效
+        for _ in range(3):
+            try:
+                self._g1_loco.StopMove()
+            except Exception:
+                pass
         self._on_nav_stop()
         if self._ros_worker:
             self._ros_worker.stop()
@@ -1452,6 +1853,29 @@ class MainWindow(QMainWindow):
         self.cfg["pcd_path"] = self._edit_pcd.text()
         save_config(self.cfg)
         super().closeEvent(e)
+
+
+# ============================================================
+# 安全退出：进程异常退出时紧急停止机器人
+# ============================================================
+_g1_loco_ref = None  # 全局引用
+
+def _global_emergency_stop():
+    """atexit/signal 安全网：无论进程如何退出都发送停止命令"""
+    global _g1_loco_ref
+    if _g1_loco_ref:
+        for _ in range(5):
+            try:
+                _g1_loco_ref.StopMove()
+            except Exception:
+                pass
+        try:
+            _g1_loco_ref.Move(0, 0, 0, continous_move=False)
+        except Exception:
+            pass
+
+atexit.register(_global_emergency_stop)
+# 不注册 SIGTERM handler — Qt 自己管理信号，手动注册会导致段错误
 
 
 # ============================================================
