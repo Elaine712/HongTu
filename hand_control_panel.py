@@ -138,14 +138,33 @@ class HandDriver(threading.Thread):
 
         self.running = True
         tick = 0
+        self.baseline = [0] * FINGERS
+        calib_samples = []
+        calib_done = False
         while self.running:
             # 读状态
             try:
                 data = self.handler.read()
                 s = data.get('states', {})
+                forces = list(s.get('FORCE_ACT', [0]*FINGERS))
+
+                # 自动校准: 收集前 20 帧平均值作为零偏
+                if not calib_done:
+                    if len(forces) == FINGERS and all(f != 0 for f in forces):
+                        calib_samples.append(forces)
+                    if len(calib_samples) >= 20:
+                        self.baseline = [int(sum(c[i] for c in calib_samples) / len(calib_samples))
+                                          for i in range(FINGERS)]
+                        print(f"[{self.lr}] 自动校准: baseline={self.baseline}")
+                        calib_done = True
+
+                calibrated = [forces[i] - self.baseline[i]
+                              if i < len(forces) else 0
+                              for i in range(FINGERS)]
+
                 self.state = {
                     'angle': list(s.get('ANGLE_ACT', [])),
-                    'force': list(s.get('FORCE_ACT', [])),
+                    'force': calibrated,
                     'status': list(s.get('STATUS', [])),
                 }
             except Exception:
@@ -206,6 +225,9 @@ class MotorRow(QFrame):
         self.fb.setStyleSheet("font-family:monospace; font-size:10px; color:#a6e3a1;")
         layout.addWidget(self.fb)
 
+        # 力传感指示器（不显示，由底部传感器面板替代）
+        self.force_bar = None
+
     def _on_change(self, v):
         self.val.setText(str(v))
         self.value_changed.emit(self.idx, v)
@@ -218,6 +240,10 @@ class MotorRow(QFrame):
 
     def set_fb(self, v):
         self.fb.setText(str(int(v)))
+
+    def set_force(self, v):
+        """力值（已弃用，由底部传感器面板显示）"""
+        pass
 
 
 class HandCanvas(QWidget):
@@ -342,17 +368,47 @@ class HandSidePanel(QGroupBox):
         layout.addWidget(estop)
 
         # 状态反馈
-        fb_row = QHBoxLayout()
-        self.angle_lbl = QLabel("角度: --")
-        self.angle_lbl.setStyleSheet("font-family:monospace; font-size:10px; color:#89b4fa;")
-        fb_row.addWidget(self.angle_lbl)
-        self.force_lbl = QLabel("力: --")
-        self.force_lbl.setStyleSheet("font-family:monospace; font-size:10px; color:#f9e2af;")
-        fb_row.addWidget(self.force_lbl)
+        fb_group = QGroupBox("传感器反馈")
+        fb_layout = QVBoxLayout(fb_group)
+        fb_layout.setSpacing(2)
+        fb_layout.setContentsMargins(6, 12, 6, 6)
+
+        # 每指力值显示
+        self.force_bars = []
+        self.force_values = []
+        for i, n in enumerate(FINGER_NAMES):
+            row = QHBoxLayout()
+            row.setSpacing(4)
+            lbl = QLabel(f"{n}")
+            lbl.setFixedWidth(36)
+            lbl.setStyleSheet("font-size:10px; color:#cdd6f4;")
+            row.addWidget(lbl)
+
+            bar = QLabel("")
+            bar.setFixedHeight(14)
+            bar.setMinimumWidth(100)
+            bar.setStyleSheet("background:#313244; border-radius:3px;")
+            row.addWidget(bar, 1)
+            self.force_bars.append(bar)
+
+            val = QLabel("0")
+            val.setFixedWidth(35)
+            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            val.setStyleSheet("font-family:monospace; font-size:10px; color:#f9e2af;")
+            row.addWidget(val)
+            self.force_values.append(val)
+
+            fb_layout.addLayout(row)
+
+        # 状态行
+        status_row = QHBoxLayout()
         self.st_lbl = QLabel("--")
         self.st_lbl.setStyleSheet("font-size:10px; color:#a6e3a1; font-weight:bold;")
-        fb_row.addWidget(self.st_lbl)
-        layout.addLayout(fb_row)
+        status_row.addWidget(self.st_lbl)
+        status_row.addStretch()
+        fb_layout.addLayout(status_row)
+
+        layout.addWidget(fb_group)
 
     def _start(self):
         # DDS 初始化 (全局只需一次)
@@ -420,12 +476,32 @@ class HandSidePanel(QGroupBox):
                 row.set_fb(angles[i])
         self.canvas.update_pos(angles if angles else [POS_DEFAULT]*FINGERS)
 
+        # 每指力值 + 力条（已自动校准零偏）
         forces = s.get('force', [])
-        if forces:
-            self.force_lbl.setText(f"力: {forces}")
+        for i in range(FINGERS):
+            fv = int(forces[i]) if i < len(forces) else 0
+            av = max(0, fv)  # 校准后负值视为 0
+            self.force_values[i].setText(str(av))
+
+            # 力条: 宽度按比例, 颜色按级别
+            max_w = 140
+            bar_w = min(max_w, int(av / 100.0 * max_w))  # 100 = 满条
+            if av == 0:
+                color = "#313244"
+            elif av < 30:
+                color = "#a6e3a1"  # 绿
+            elif av < 80:
+                color = "#f9e2af"  # 黄
+            else:
+                color = "#f38ba8"  # 红
+            self.force_bars[i].setFixedWidth(max(bar_w, 2))
+            self.force_bars[i].setStyleSheet(
+                f"background:{color}; border-radius:3px;")
+
         statuses = s.get('status', [])
         if statuses:
-            self.st_lbl.setText(STATUS_LABELS.get(statuses[0], str(statuses[0])))
+            labels = [STATUS_LABELS.get(sv, str(sv)) for sv in statuses]
+            self.st_lbl.setText(" | ".join(labels))
 
     def set_all_targets(self, vals):
         for i, v in enumerate(vals):
