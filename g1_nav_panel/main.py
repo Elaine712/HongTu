@@ -156,8 +156,11 @@ COORDINATED_ACTIONS = {
 # ============================================================
 # G1 低阶手臂控制常量 (arm_sdk)
 # ============================================================
-G1_ARM_JOINT_NAMES = ["肩前后", "肩左右", "肩旋转", "肘", "腕旋转", "腕俯仰", "腕偏航"]
-G1_ARM_JOINT_IDS = [22, 23, 24, 25, 26, 27, 28]
+G1_ARM_JOINT_NAMES = [
+    "左肩前后", "左肩左右", "左肩旋转", "左肘", "左腕旋转", "左腕俯仰", "左腕偏航",
+    "右肩前后", "右肩左右", "右肩旋转", "右肘", "右腕旋转", "右腕俯仰", "右腕偏航",
+]
+G1_ARM_JOINT_IDS = [15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
 # 每个关节的 Kp/Kd 和角度范围（弧度）
 G1_ARM_PARAMS = [
     {"kp": 80.0, "kd": 3.0, "min": -2.0, "max": 2.0},
@@ -167,7 +170,15 @@ G1_ARM_PARAMS = [
     {"kp": 40.0, "kd": 1.5, "min": -1.5, "max": 1.5},
     {"kp": 40.0, "kd": 1.5, "min": -1.0, "max": 1.0},
     {"kp": 40.0, "kd": 1.5, "min": -1.0, "max": 1.0},
+    {"kp": 80.0, "kd": 3.0, "min": -2.0, "max": 2.0},
+    {"kp": 80.0, "kd": 3.0, "min": -1.5, "max": 1.5},
+    {"kp": 80.0, "kd": 3.0, "min": -2.5, "max": 2.5},
+    {"kp": 80.0, "kd": 3.0, "min": -2.5, "max": 3.0},
+    {"kp": 40.0, "kd": 1.5, "min": -1.5, "max": 1.5},
+    {"kp": 40.0, "kd": 1.5, "min": -1.0, "max": 1.0},
+    {"kp": 40.0, "kd": 1.5, "min": -1.0, "max": 1.0},
 ]
+G1_ARM_DOF = len(G1_ARM_JOINT_IDS)
 G1_ARM_SDK_ENABLE_JOINT = 29  # kNotUsedJoint, q=1 启用 arm_sdk
 
 
@@ -806,8 +817,8 @@ class MainWindow(QMainWindow):
         self._arm_sdk_ready = False
         self._arm_sdk_pub = None
         self._arm_sdk_cmd = None
-        self._arm_sdk_targets = [0.0]*7
-        self._arm_sdk_current_cmd_q = [0.0]*7
+        self._arm_sdk_targets = [0.0]*G1_ARM_DOF
+        self._arm_sdk_current_cmd_q = [0.0]*G1_ARM_DOF
         self._arm_low_state = None
         self._arm_low_state_lock = threading.Lock()
         self._arm_low_state_event = threading.Event()
@@ -819,6 +830,7 @@ class MainWindow(QMainWindow):
         self._arm_sdk_weight = 0.0
         self._arm_sdk_publish_dt = 1.0 / 250.0
         self._arm_sdk_velocity_limit = 2.0
+        self._arm_sdk_motion_start_error = 0.0
         self._arm_sdk_crc = CRC() if ARM_LOW_OK else None
         self._poses = []
         self._pose_timer = None
@@ -830,9 +842,9 @@ class MainWindow(QMainWindow):
         self._map_data = None
 
         self._init_ui()
-        self._load_settings()
-        self._start_ros()
         self.log_message.connect(self._append_log)
+        self._load_settings()
+        self._status_ros.setText("ROS: 未启动")
 
     # ================================================================
     # UI 构建
@@ -908,6 +920,22 @@ class MainWindow(QMainWindow):
 
         # 工具栏
         toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("G1 网卡:"))
+        self._nav_net_if = QLineEdit(self.cfg.get("net_if", "eno1"))
+        self._nav_net_if.setFixedWidth(96)
+        toolbar.addWidget(self._nav_net_if)
+
+        self._btn_g1 = QPushButton("连接 G1")
+        self._btn_g1.setMinimumHeight(36)
+        self._btn_g1.clicked.connect(self._on_g1_toggle)
+        toolbar.addWidget(self._btn_g1)
+        self._btn_nav_g1 = self._btn_g1
+
+        self._g1_label = QLabel("G1: 未连接")
+        self._g1_label.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px 10px; color: #888;")
+        toolbar.addWidget(self._g1_label)
+        self._nav_g1_label = self._g1_label
+
         self._btn_nav_start = QPushButton("▶ 启动导航")
         self._btn_nav_start.setProperty("class", "success")
         self._btn_nav_start.setMinimumHeight(36)
@@ -1060,24 +1088,10 @@ class MainWindow(QMainWindow):
         st.addWidget(self._nav_state_label)
         right.addWidget(grp)
 
-        # G1 连接
-        grp = QGroupBox("G1 机器人")
+        # G1 快捷控制
+        grp = QGroupBox("G1 快捷控制")
         grp.setFont(title_font)
         gg = QVBoxLayout(grp)
-
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("网卡:"))
-        self._nav_net_if = QLineEdit(self.cfg.get("net_if", "eno1"))
-        self._nav_net_if.setFixedWidth(100)
-        row1.addWidget(self._nav_net_if)
-        self._btn_nav_g1 = QPushButton("连接 G1")
-        self._btn_nav_g1.clicked.connect(self._on_g1_toggle)
-        row1.addWidget(self._btn_nav_g1)
-        self._nav_g1_label = QLabel("未连接")
-        self._nav_g1_label.setStyleSheet("color: #888;")
-        row1.addWidget(self._nav_g1_label)
-        row1.addStretch()
-        gg.addLayout(row1)
 
         # 快速动作
         row2 = QHBoxLayout()
@@ -1086,7 +1100,7 @@ class MainWindow(QMainWindow):
                        ("握手", "shake hand"), ("拒绝", "reject")]
         for cn_name, an in quick_acts:
             btn = QPushButton(cn_name)
-            btn.setFixedWidth(56)
+            btn.setMinimumWidth(64)
             btn.setMinimumHeight(28)
             btn.clicked.connect(lambda checked, n=an: self._g1_arm_action(n))
             row2.addWidget(btn)
@@ -1099,7 +1113,7 @@ class MainWindow(QMainWindow):
             row_hand.addWidget(QLabel("手部:"))
             for hname in ["张开", "握拳", "OK", "点赞", "点按"]:
                 btn = QPushButton(hname)
-                btn.setFixedWidth(48)
+                btn.setMinimumWidth(58)
                 btn.setMinimumHeight(28)
                 btn.clicked.connect(lambda checked, n=hname: self._hand_set_preset("r", n))
                 row_hand.addWidget(btn)
@@ -1282,18 +1296,14 @@ class MainWindow(QMainWindow):
     # ---- 动作标签页 ----
     def _build_action_tab(self):
         tab = QWidget()
-        layout = QVBoxLayout(tab)
-
-        # G1 连接
-        grp = QGroupBox("G1 机器人连接")
-        gl = QHBoxLayout(grp)
-        self._btn_g1 = QPushButton("连接 G1")
-        self._btn_g1.clicked.connect(self._on_g1_toggle)
-        gl.addWidget(self._btn_g1)
-        self._g1_label = QLabel("状态: 未连接")
-        gl.addWidget(self._g1_label)
-        gl.addStretch()
-        layout.addWidget(grp)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(8)
+        layout.setContentsMargins(8, 8, 8, 8)
 
         # FSM 模式
         grp = QGroupBox("FSM 模式切换")
@@ -1316,6 +1326,8 @@ class MainWindow(QMainWindow):
                    ("shake hand", "握手"), ("x-ray", "展示"), ("high five", "击掌")]
         for aname, cn in common:
             btn = QPushButton(cn)
+            btn.setMinimumWidth(72)
+            btn.setMinimumHeight(32)
             btn.clicked.connect(lambda checked, n=aname: self._g1_arm_action(n))
             gl.addWidget(btn)
         gl.addStretch()
@@ -1324,19 +1336,20 @@ class MainWindow(QMainWindow):
         # 全部动作展开
         grp = QGroupBox("全部手臂动作")
         gl = QHBoxLayout(grp)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        action_scroll = QScrollArea()
+        action_scroll.setWidgetResizable(True)
         sw = QWidget()
         fl = QHBoxLayout(sw)
         for aname in sorted(ARM_ACTIONS.keys()):
             cn = ACTION_CN.get(aname, aname.replace("_", " "))
             btn = QPushButton(cn)
-            btn.setFixedWidth(80)
+            btn.setMinimumWidth(88)
+            btn.setMinimumHeight(32)
             btn.clicked.connect(lambda checked, n=aname: self._g1_arm_action(n))
             fl.addWidget(btn)
         fl.addStretch()
-        scroll.setWidget(sw)
-        gl.addWidget(scroll)
+        action_scroll.setWidget(sw)
+        gl.addWidget(action_scroll)
         layout.addWidget(grp)
 
         # ---- 灵巧手集成 ----
@@ -1362,6 +1375,8 @@ class MainWindow(QMainWindow):
             for aname, (_, hand_preset) in COORDINATED_ACTIONS.items():
                 cn = ACTION_CN.get(aname, aname)
                 btn = QPushButton(cn)
+                btn.setMinimumWidth(72)
+                btn.setMinimumHeight(32)
                 btn.clicked.connect(lambda checked, n=aname: self._g1_coordinated_action(n))
                 gl.addWidget(btn)
             gl.addStretch()
@@ -1437,6 +1452,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(grp)
 
         layout.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         return tab
 
     # ---- 灵巧手控制标签页（完整面板） ----
@@ -1681,7 +1698,7 @@ class MainWindow(QMainWindow):
         with self._arm_low_state_lock:
             return self._arm_low_state
 
-    def _arm_sdk_get_current_right_arm_q(self):
+    def _arm_sdk_get_current_arm_q(self):
         state = self._arm_current_lowstate()
         if not state:
             return None
@@ -1695,7 +1712,7 @@ class MainWindow(QMainWindow):
         cmd = unitree_hg_msg_dds__LowCmd_()
         cmd.mode_pr = 0
         cmd.mode_machine = state.mode_machine
-        right_arm = set(G1_ARM_JOINT_IDS)
+        arm_set = set(G1_ARM_JOINT_IDS)
         for joint in G1JointIndex:
             idx = int(joint)
             motor = cmd.motor_cmd[idx]
@@ -1703,7 +1720,7 @@ class MainWindow(QMainWindow):
             motor.q = float(state.motor_state[idx].q)
             motor.dq = 0.0
             motor.tau = 0.0
-            if idx in right_arm:
+            if idx in arm_set:
                 if joint in WRIST_MOTORS:
                     motor.kp = 40.0
                     motor.kd = 1.5
@@ -1809,11 +1826,43 @@ class MainWindow(QMainWindow):
 
     def _arm_sdk_set_joints(self, angles):
         """设置目标关节角度"""
+        target = self._normalize_arm_pose(angles)
         with self._arm_sdk_target_lock:
-            for i in range(min(len(angles), 7)):
+            current = list(self._arm_sdk_current_cmd_q)
+            self._arm_sdk_motion_start_error = max(
+                [abs(float(t) - float(c)) for t, c in zip(target, current)] + [0.0]
+            )
+            for i in range(min(len(target), G1_ARM_DOF)):
                 lo = G1_ARM_PARAMS[i]["min"]
                 hi = G1_ARM_PARAMS[i]["max"]
-                self._arm_sdk_targets[i] = max(lo, min(hi, float(angles[i])))
+                self._arm_sdk_targets[i] = max(lo, min(hi, float(target[i])))
+
+    def _normalize_arm_pose(self, angles):
+        """兼容旧版 7 关节右臂姿态；新版使用 14 关节双臂姿态。"""
+        values = [float(v) for v in angles] if angles else []
+        if len(values) >= G1_ARM_DOF:
+            return values[:G1_ARM_DOF]
+        with self._arm_sdk_target_lock:
+            target = list(self._arm_sdk_targets)
+        if len(values) == 7 and G1_ARM_DOF == 14:
+            target[7:14] = values
+            return target
+        for i, value in enumerate(values):
+            if i < G1_ARM_DOF:
+                target[i] = value
+        return target
+
+    def _arm_motion_progress(self):
+        with self._arm_sdk_target_lock:
+            targets = list(self._arm_sdk_targets)
+            current = list(self._arm_sdk_current_cmd_q)
+            start_error = float(self._arm_sdk_motion_start_error)
+        error = max([abs(float(t) - float(c)) for t, c in zip(targets, current)] + [0.0])
+        if error < 0.01:
+            return 100
+        if start_error <= 0.01:
+            return 0
+        return max(0, min(100, int((1.0 - error / start_error) * 100)))
 
     # ================================================================
     # 姿态录制 / 回放系统
@@ -1853,7 +1902,7 @@ class MainWindow(QMainWindow):
             self._log("[姿态] 请先激活低阶控制再执行")
             return
         # 1. 设置手臂关节
-        self._arm_sdk_set_joints(pose.get("arm", [0.0]*7))
+        self._arm_sdk_set_joints(pose.get("arm", [0.0]*G1_ARM_DOF))
         self._log(f"[姿态] 手臂: {name}")
         # 2. 设置手部
         hand = pose.get("hand_r", [500]*6)
@@ -1884,7 +1933,8 @@ class MainWindow(QMainWindow):
             return
         self._pose_list.clear()
         for i, p in enumerate(self._poses):
-            arm_str = ", ".join(f"{a:.2f}" for a in p.get("arm", []))
+            arm_vals = p.get("arm", [])
+            arm_str = f"{len(arm_vals)} 关节"
             hand_str = ", ".join(str(h) for h in p.get("hand_r", []))
             self._pose_list.addItem(f"{i+1}. {p.get('name', '未命名')}  臂:[{arm_str}]  手:[{hand_str}]")
 
@@ -1920,61 +1970,89 @@ class MainWindow(QMainWindow):
     # ---- 姿态编辑标签页 ----
     def _build_pose_tab(self):
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setSpacing(6)
+        layout.setContentsMargins(8, 8, 8, 8)
 
         # ── 手臂关节控制 ──
-        grp = QGroupBox("手臂关节 (arm_sdk 低阶控制)")
+        grp = QGroupBox("双臂关节 (arm_sdk 低阶控制)")
         gl = QVBoxLayout(grp)
-        gl.setSpacing(2)
+        gl.setSpacing(6)
 
         self._pose_arm_sliders = []  # (slider, val_label, min, max)
-        slider_rows = QHBoxLayout()
-        slider_col = QVBoxLayout()
-        val_col = QVBoxLayout()
-        val_col.setAlignment(Qt.AlignRight)
-        for i, jname in enumerate(G1_ARM_JOINT_NAMES):
-            row = QHBoxLayout()
-            row.setSpacing(3)
-            lbl = QLabel(jname)
-            lbl.setFixedWidth(40)
-            lbl.setStyleSheet("font-size:10px;")
-            row.addWidget(lbl)
+        arms_row = QHBoxLayout()
+        arms_row.setSpacing(8)
 
-            # 滑块：弧度值映射到整数范围
-            lo, hi = G1_ARM_PARAMS[i]["min"], G1_ARM_PARAMS[i]["max"]
-            sld = QSlider(Qt.Horizontal)
-            sld.setRange(int(lo*100), int(hi*100))
-            sld.setValue(0)
-            sld.valueChanged.connect(lambda v, idx=i: self._pose_arm_slider(idx, v/100.0))
-            row.addWidget(sld, 1)
+        for side_name, start_idx in (("左臂", 0), ("右臂", 7)):
+            arm_grp = QGroupBox(side_name)
+            arm_layout = QVBoxLayout(arm_grp)
+            arm_layout.setSpacing(4)
+            arm_layout.setContentsMargins(8, 16, 8, 8)
+            for offset in range(7):
+                i = start_idx + offset
+                jname = G1_ARM_JOINT_NAMES[i].replace("左", "").replace("右", "")
+                row = QHBoxLayout()
+                row.setSpacing(6)
+                lbl = QLabel(jname)
+                lbl.setMinimumWidth(64)
+                lbl.setStyleSheet("font-size:11px;")
+                row.addWidget(lbl)
 
-            vl = QLabel("0.00")
-            vl.setFixedWidth(36)
-            vl.setAlignment(Qt.AlignRight|Qt.AlignVCenter)
-            vl.setStyleSheet("font-size:10px; font-family:monospace;")
-            row.addWidget(vl)
-            gl.addLayout(row)
-            self._pose_arm_sliders.append((sld, vl, lo, hi))
+                lo, hi = G1_ARM_PARAMS[i]["min"], G1_ARM_PARAMS[i]["max"]
+                sld = QSlider(Qt.Horizontal)
+                sld.setRange(int(lo*100), int(hi*100))
+                sld.setValue(0)
+                sld.setMinimumWidth(180)
+                sld.valueChanged.connect(lambda v, idx=i: self._pose_arm_slider(idx, v/100.0))
+                row.addWidget(sld, 1)
+
+                vl = QLabel("0.00")
+                vl.setMinimumWidth(44)
+                vl.setAlignment(Qt.AlignRight|Qt.AlignVCenter)
+                vl.setStyleSheet("font-size:11px; font-family:monospace;")
+                row.addWidget(vl)
+                arm_layout.addLayout(row)
+                self._pose_arm_sliders.append((sld, vl, lo, hi))
+            arms_row.addWidget(arm_grp, 1)
+
+        gl.addLayout(arms_row)
 
         # 工具按钮
         tool_row = QHBoxLayout()
         self._pose_arm_activate = QPushButton("⚠ 激活臂控")
+        self._pose_arm_activate.setMinimumHeight(34)
         self._pose_arm_activate.setStyleSheet("font-weight:bold; color:#fff; background:#e67e22;")
         self._pose_arm_activate.clicked.connect(self._pose_arm_activate_toggle)
         tool_row.addWidget(self._pose_arm_activate)
         btn_read = QPushButton("读取当前姿态")
+        btn_read.setMinimumHeight(34)
         btn_read.clicked.connect(self._pose_arm_read_current)
         tool_row.addWidget(btn_read)
         btn_zero = QPushButton("归零")
+        btn_zero.setMinimumHeight(34)
         btn_zero.clicked.connect(self._pose_arm_zero)
         tool_row.addWidget(btn_zero)
         tool_row.addStretch()
 
         self._pose_arm_status = QLabel("臂控: 未激活")
-        self._pose_arm_status.setStyleSheet("color:#f38ba8; font-size:10px;")
+        self._pose_arm_status.setMinimumWidth(100)
+        self._pose_arm_status.setStyleSheet("color:#f38ba8; font-size:11px;")
         tool_row.addWidget(self._pose_arm_status)
         gl.addLayout(tool_row)
+
+        progress_row = QHBoxLayout()
+        progress_row.addWidget(QLabel("操作进度:"))
+        self._pose_arm_progress = QProgressBar()
+        self._pose_arm_progress.setRange(0, 100)
+        self._pose_arm_progress.setValue(0)
+        self._pose_arm_progress.setMinimumHeight(20)
+        progress_row.addWidget(self._pose_arm_progress, 1)
+        gl.addLayout(progress_row)
         layout.addWidget(grp)
 
         # ── 灵巧手手势 ──
@@ -2047,13 +2125,19 @@ class MainWindow(QMainWindow):
         self._pose_timer.timeout.connect(self._pose_tick)
         self._pose_timer.start(50)
 
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         return tab
 
     def _pose_arm_slider(self, idx, val_rad):
         """手臂滑块拖动 → 设置关节角度 → 发布 arm_sdk"""
         if idx < len(G1_ARM_JOINT_IDS) and idx < len(self._arm_sdk_targets):
             with self._arm_sdk_target_lock:
+                current = list(self._arm_sdk_current_cmd_q)
                 self._arm_sdk_targets[idx] = val_rad
+                self._arm_sdk_motion_start_error = max(
+                    [abs(float(t) - float(c)) for t, c in zip(self._arm_sdk_targets, current)] + [0.0]
+                )
             self._pose_arm_sliders[idx][1].setText(f"{val_rad:.2f}")
 
     def _pose_arm_read_current(self):
@@ -2067,6 +2151,8 @@ class MainWindow(QMainWindow):
             with self._arm_sdk_target_lock:
                 if i < len(self._arm_sdk_targets):
                     self._arm_sdk_targets[i] = val
+                    self._arm_sdk_current_cmd_q[i] = val
+                self._arm_sdk_motion_start_error = 0.0
             if i < len(self._pose_arm_sliders):
                 sld, vl, lo, hi = self._pose_arm_sliders[i]
                 sld.blockSignals(True)
@@ -2076,7 +2162,7 @@ class MainWindow(QMainWindow):
         self._log("[姿态] 已读取当前关节角度")
 
     def _pose_arm_activate_toggle(self):
-        """切换 arm_sdk 激活状态（xr 风格全关节初始化，仅更新右臂）"""
+        """切换 arm_sdk 激活状态（xr 风格全关节初始化，更新双臂）"""
         if not self._arm_sdk_ready:
             self._log("[姿态] arm_sdk 未就绪（G1 未连接）")
             return
@@ -2084,12 +2170,14 @@ class MainWindow(QMainWindow):
             if not self._arm_low_state_event.wait(timeout=2.0):
                 self._log("[姿态] 未收到 rt/lowstate，禁止激活臂控")
                 return
-            current = self._arm_sdk_get_current_right_arm_q()
+            current = self._arm_sdk_get_current_arm_q()
             if current is None:
                 self._log("[姿态] 无 lowstate 数据，禁止激活臂控")
                 return
             with self._arm_sdk_target_lock:
                 self._arm_sdk_targets = list(current)
+                self._arm_sdk_current_cmd_q = list(current)
+                self._arm_sdk_motion_start_error = 0.0
                 self._arm_sdk_weight = 0.0
             for i, val in enumerate(current):
                 if i < len(self._pose_arm_sliders):
@@ -2107,9 +2195,11 @@ class MainWindow(QMainWindow):
             self._pose_timer.start(50)
             self._pose_arm_activate.setText("■ 停用臂控")
             self._pose_arm_activate.setStyleSheet("font-weight:bold; color:#fff; background:#c0392b;")
-            self._log("[姿态] 臂控已激活（xr 风格全关节初始化，仅更新右臂）")
+            self._log("[姿态] 臂控已激活（xr 风格全关节初始化，双臂 14 关节）")
         else:
             self._arm_sdk_release()
+            if hasattr(self, '_pose_arm_progress'):
+                self._pose_arm_progress.setValue(0)
             self._pose_timer.start(50)
             self._pose_arm_activate.setText("⚠ 激活臂控")
             self._pose_arm_activate.setStyleSheet("font-weight:bold; color:#fff; background:#e67e22;")
@@ -2117,12 +2207,14 @@ class MainWindow(QMainWindow):
 
     def _pose_arm_zero(self):
         """手臂归零"""
-        self._arm_sdk_set_joints([0.0]*7)
+        self._arm_sdk_set_joints([0.0]*G1_ARM_DOF)
         for i, (sld, vl, lo, hi) in enumerate(self._pose_arm_sliders):
             sld.blockSignals(True)
             sld.setValue(0)
             sld.blockSignals(False)
             vl.setText("0.00")
+        if hasattr(self, '_pose_arm_progress'):
+            self._pose_arm_progress.setValue(0)
         self._log("[姿态] 手臂归零")
 
     def _pose_hand_preset(self, name):
@@ -2150,9 +2242,13 @@ class MainWindow(QMainWindow):
         if self._arm_sdk_ready and self._arm_sdk_active:
             self._pose_arm_status.setText("臂控: 运行中")
             self._pose_arm_status.setStyleSheet("color:#a6e3a1; font-size:10px;")
+            if hasattr(self, '_pose_arm_progress'):
+                self._pose_arm_progress.setValue(self._arm_motion_progress())
         else:
             self._pose_arm_status.setText("臂控: 未激活")
             self._pose_arm_status.setStyleSheet("color:#f38ba8; font-size:10px;")
+            if hasattr(self, '_pose_arm_progress'):
+                self._pose_arm_progress.setValue(0)
 
     def _pose_estop(self):
         """急停：停止低阶控制"""
@@ -2160,6 +2256,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_pose_arm_activate'):
             self._pose_arm_activate.setText("⚠ 激活臂控")
             self._pose_arm_activate.setStyleSheet("font-weight:bold; color:#fff; background:#e67e22;")
+        if hasattr(self, '_pose_arm_progress'):
+            self._pose_arm_progress.setValue(0)
         self._log("[姿态] 急停（arm_sdk 已平滑释放）")
 
     # ---- 设置标签页 ----
@@ -2245,6 +2343,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "点云文件不存在", f"请选择有效的 PCD 文件\n{pcd_path}")
             return
 
+        self._start_ros()
+
         # 保存配置
         self.cfg["map_yaml"] = map_yaml
         self.cfg["pcd_path"] = pcd_path
@@ -2327,10 +2427,8 @@ class MainWindow(QMainWindow):
             self._arm_sdk_pub = None
             self._arm_sdk_cmd = None
             self._btn_g1.setText("连接 G1")
-            self._g1_label.setText("状态: 已断开")
-            self._btn_nav_g1.setText("连接 G1")
-            self._nav_g1_label.setText("未连接")
-            self._nav_g1_label.setStyleSheet("color: #888;")
+            self._g1_label.setText("G1: 未连接")
+            self._g1_label.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px 10px; color: #888;")
             self._status_g1.setText("G1: 未连接")
             return
         if not G1_OK:
@@ -2374,7 +2472,8 @@ class MainWindow(QMainWindow):
 
             # ---- arm_sdk 初始化：命令包等待激活时从 lowstate 完整构造 ----
             self._arm_sdk_ready = False
-            self._arm_sdk_targets = [0.0]*7
+            self._arm_sdk_targets = [0.0]*G1_ARM_DOF
+            self._arm_sdk_current_cmd_q = [0.0]*G1_ARM_DOF
             with self._arm_low_state_lock:
                 self._arm_low_state = None
             self._arm_low_state_event.clear()
@@ -2400,10 +2499,8 @@ class MainWindow(QMainWindow):
 
             self._g1_ready = True
             self._btn_g1.setText("断开 G1")
-            self._g1_label.setText("状态: 已连接 ✓")
-            self._btn_nav_g1.setText("断开 G1")
-            self._nav_g1_label.setText("已连接")
-            self._nav_g1_label.setStyleSheet("color: #27ae60; font-weight: bold;")
+            self._g1_label.setText("G1: 已连接")
+            self._g1_label.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px 10px; color: #27ae60;")
             self._status_g1.setText("G1: 已连接")
             self._log("[G1] 连接成功")
         except Exception as e:
@@ -2908,6 +3005,7 @@ class MainWindow(QMainWindow):
             self._edit_pcd.setText(self.cfg["pcd_path"])
         if self.cfg.get("net_if"):
             self._edit_net.setText(self.cfg["net_if"])
+            self._nav_net_if.setText(self.cfg["net_if"])
 
     def closeEvent(self, e):
         # 紧急停止机器人
@@ -2930,7 +3028,7 @@ class MainWindow(QMainWindow):
             self._ros_worker.stop()
             self._ros_worker.wait(2000)
         # 保存配置
-        self.cfg["net_if"] = self._edit_net.text()
+        self.cfg["net_if"] = self._nav_net_if.text().strip() or self._edit_net.text().strip()
         self.cfg["map_yaml"] = self._edit_map.text()
         self.cfg["pcd_path"] = self._edit_pcd.text()
         save_config(self.cfg)
@@ -2964,13 +3062,25 @@ atexit.register(_global_emergency_stop)
 # 入口
 # ============================================================
 def main():
+    print("[启动] main.py 已进入", flush=True)
+    display = os.environ.get("DISPLAY")
+    wayland = os.environ.get("WAYLAND_DISPLAY")
+    qpa = os.environ.get("QT_QPA_PLATFORM")
+    print(f"[启动] DISPLAY={display!r} WAYLAND_DISPLAY={wayland!r} QT_QPA_PLATFORM={qpa!r}", flush=True)
+    if sys.platform.startswith("linux") and not display and not wayland and not qpa:
+        print("[启动] 未检测到图形显示环境，无法打开 PyQt GUI。请在桌面终端运行，或设置 DISPLAY。", flush=True)
+        return 2
+    print("[启动] 初始化 QApplication…", flush=True)
     app = QApplication(sys.argv)
+    print("[启动] QApplication 完成，开始创建主窗口…", flush=True)
     app.setStyle("Fusion")
     app.setApplicationName("G1 导航控制台")
     win = MainWindow()
+    print("[启动] 主窗口创建完成，显示窗口…", flush=True)
     win.show()
-    sys.exit(app.exec_())
+    print("[启动] 窗口已显示，进入事件循环", flush=True)
+    return app.exec_()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
