@@ -76,9 +76,9 @@ class ModbusDataHandler:
         try:
             if initDDS:
                 if network is None:
-                    ChannelFactoryInitialize(0, network)
-                else:
                     ChannelFactoryInitialize(0)
+                else:
+                    ChannelFactoryInitialize(0, network)
         except Exception as e:
             print(f"Error during ChannelFactory initialization: {e}")
             # 这里可以添加日志记录或其他恢复机制

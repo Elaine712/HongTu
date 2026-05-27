@@ -19,6 +19,7 @@ import subprocess
 import sys
 import threading
 import time
+from enum import IntEnum
 
 from PyQt5.QtCore import (
     QByteArray, QBuffer, QIODevice, QPointF, QRectF, QSize, Qt, QTimer, QThread, pyqtSignal
@@ -54,14 +55,54 @@ except Exception:
 # ============================================================
 try:
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+    from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
     from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
     from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
     from unitree_sdk2py.g1.arm.g1_arm_action_client import action_map as ARM_ACTIONS
     from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient as G1AudioClient
+    from unitree_sdk2py.core.channel import ChannelPublisher
     G1_OK = True
 except Exception:
     G1_OK = False
     ARM_ACTIONS = {}
+
+# ============================================================
+# G1 低阶手臂控制 (arm_sdk)
+# ============================================================
+try:
+    from unitree_sdk2py.utils.crc import CRC
+    from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
+    from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
+    ARM_LOW_OK = True
+except Exception:
+    ARM_LOW_OK = False
+
+# ============================================================
+# Inspire RH56E2 灵巧手导入
+# ============================================================
+_HAND_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "inspire_hand")
+if _HAND_PATH not in sys.path:
+    sys.path.insert(0, _HAND_PATH)
+try:
+    from inspire_sdkpy.inspire_dds import inspire_hand_ctrl as _hand_ctrl_type
+    from inspire_sdkpy.inspire_dds import inspire_hand_state as _hand_state_type
+    from inspire_sdkpy.inspire_hand_defaut import get_inspire_hand_ctrl
+    HAND_OK = True
+except Exception:
+    HAND_OK = False
+    _hand_ctrl_type = None
+    _hand_state_type = None
+    get_inspire_hand_ctrl = None
+
+# 导入灵巧手控制面板组件（复用 UI 组件）
+try:
+    _PANEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    if _PANEL_PATH not in sys.path:
+        sys.path.insert(0, _PANEL_PATH)
+    from hand_control_panel import MotorRow, HandCanvas, FINGER_NAMES as _FN
+    HAS_HAND_WIDGETS = True
+except Exception:
+    HAS_HAND_WIDGETS = False
 
 # 英文动作名 → 中文显示名
 ACTION_CN = {
@@ -81,6 +122,113 @@ ACTION_CN = {
     "left kiss": "左手飞吻",
     "right kiss": "右手飞吻",
     "release arm": "释放手臂",
+}
+
+# ============================================================
+# RH56E2 灵巧手常量
+# ============================================================
+HAND_PRESETS = {
+    "张开":   [1000, 1000, 1000, 1000, 1000, 1000],
+    "握拳":   [0, 0, 0, 0, 0, 0],
+    "指向":   [0, 0, 0, 1000, 0, 500],
+    "OK":     [0, 0, 0, 0, 300, 300],
+    "点赞":   [0, 0, 0, 0, 1000, 500],
+    "摇滚":   [1000, 0, 0, 1000, 1000, 500],
+    "三指捏": [0, 0, 300, 300, 300, 300],
+    "半开":   [500, 500, 500, 500, 500, 500],
+    "点按":   [0, 0, 0, 800, 0, 500],
+}
+
+# G1 手臂动作名 → (G1 动作名, 灵巧手势名)
+COORDINATED_ACTIONS = {
+    "face wave":   ("face wave",  "张开"),
+    "shake hand":  ("shake hand", "握拳"),
+    "clap":        ("clap",       "张开"),
+    "heart":       ("heart",      "OK"),
+    "right hand up": ("right hand up", "张开"),
+    "high five":   ("high five",  "张开"),
+    "hug":         ("hug",        "半开"),
+    "reject":      ("reject",     "张开"),
+    "x-ray":       ("x-ray",      "张开"),
+    "hands up":    ("hands up",   "张开"),
+}
+
+# ============================================================
+# G1 低阶手臂控制常量 (arm_sdk)
+# ============================================================
+G1_ARM_JOINT_NAMES = ["肩前后", "肩左右", "肩旋转", "肘", "腕旋转", "腕俯仰", "腕偏航"]
+G1_ARM_JOINT_IDS = [22, 23, 24, 25, 26, 27, 28]
+# 每个关节的 Kp/Kd 和角度范围（弧度）
+G1_ARM_PARAMS = [
+    {"kp": 80.0, "kd": 3.0, "min": -2.0, "max": 2.0},
+    {"kp": 80.0, "kd": 3.0, "min": -1.5, "max": 1.5},
+    {"kp": 80.0, "kd": 3.0, "min": -2.5, "max": 2.5},
+    {"kp": 80.0, "kd": 3.0, "min": -2.5, "max": 3.0},
+    {"kp": 40.0, "kd": 1.5, "min": -1.5, "max": 1.5},
+    {"kp": 40.0, "kd": 1.5, "min": -1.0, "max": 1.0},
+    {"kp": 40.0, "kd": 1.5, "min": -1.0, "max": 1.0},
+]
+G1_ARM_SDK_ENABLE_JOINT = 29  # kNotUsedJoint, q=1 启用 arm_sdk
+
+
+class G1JointIndex(IntEnum):
+    LeftHipPitch = 0
+    LeftHipRoll = 1
+    LeftHipYaw = 2
+    LeftKnee = 3
+    LeftAnklePitch = 4
+    LeftAnkleRoll = 5
+    RightHipPitch = 6
+    RightHipRoll = 7
+    RightHipYaw = 8
+    RightKnee = 9
+    RightAnklePitch = 10
+    RightAnkleRoll = 11
+    WaistYaw = 12
+    WaistRoll = 13
+    WaistPitch = 14
+    LeftShoulderPitch = 15
+    LeftShoulderRoll = 16
+    LeftShoulderYaw = 17
+    LeftElbow = 18
+    LeftWristRoll = 19
+    LeftWristPitch = 20
+    LeftWristYaw = 21
+    RightShoulderPitch = 22
+    RightShoulderRoll = 23
+    RightShoulderYaw = 24
+    RightElbow = 25
+    RightWristRoll = 26
+    RightWristPitch = 27
+    RightWristYaw = 28
+    NotUsedJoint0 = 29
+    NotUsedJoint1 = 30
+    NotUsedJoint2 = 31
+    NotUsedJoint3 = 32
+    NotUsedJoint4 = 33
+    NotUsedJoint5 = 34
+
+
+WEAK_MOTORS = {
+    G1JointIndex.LeftAnklePitch,
+    G1JointIndex.RightAnklePitch,
+    G1JointIndex.LeftShoulderPitch,
+    G1JointIndex.LeftShoulderRoll,
+    G1JointIndex.LeftShoulderYaw,
+    G1JointIndex.LeftElbow,
+    G1JointIndex.RightShoulderPitch,
+    G1JointIndex.RightShoulderRoll,
+    G1JointIndex.RightShoulderYaw,
+    G1JointIndex.RightElbow,
+}
+
+WRIST_MOTORS = {
+    G1JointIndex.LeftWristRoll,
+    G1JointIndex.LeftWristPitch,
+    G1JointIndex.LeftWristYaw,
+    G1JointIndex.RightWristRoll,
+    G1JointIndex.RightWristPitch,
+    G1JointIndex.RightWristYaw,
 }
 
 # ============================================================
@@ -652,6 +800,28 @@ class MainWindow(QMainWindow):
         self._g1_arm = None
         self._g1_audio = None
         self._g1_ready = False
+        self._hand_pub_l = None
+        self._hand_pub_r = None
+        self._hand_ready = False
+        self._arm_sdk_ready = False
+        self._arm_sdk_pub = None
+        self._arm_sdk_cmd = None
+        self._arm_sdk_targets = [0.0]*7
+        self._arm_sdk_current_cmd_q = [0.0]*7
+        self._arm_low_state = None
+        self._arm_low_state_lock = threading.Lock()
+        self._arm_low_state_event = threading.Event()
+        self._arm_sdk_target_lock = threading.Lock()
+        self._arm_sdk_cmd_lock = threading.Lock()
+        self._arm_sdk_stop_event = threading.Event()
+        self._arm_sdk_publish_thread = None
+        self._arm_sdk_active = False
+        self._arm_sdk_weight = 0.0
+        self._arm_sdk_publish_dt = 1.0 / 250.0
+        self._arm_sdk_velocity_limit = 2.0
+        self._arm_sdk_crc = CRC() if ARM_LOW_OK else None
+        self._poses = []
+        self._pose_timer = None
         self._teleop_active = False
         self._has_active_goal = False  # 是否有活跃的导航目标，防止启动时误触发
         self._waypoints = []  # [(name, x, y, yaw, action, speech)]
@@ -769,6 +939,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_teleop_tab(), "🎮 遥控")
         tabs.addTab(self._build_waypoint_tab(), "📍 航点")
         tabs.addTab(self._build_action_tab(), "🤖 动作")
+        tabs.addTab(self._build_hand_tab(), "🖐 灵巧手")
+        tabs.addTab(self._build_pose_tab(), "🎬 姿态")
         tabs.addTab(self._build_settings_tab(), "⚙ 设置")
         main_layout.addWidget(tabs, 1)
 
@@ -920,6 +1092,19 @@ class MainWindow(QMainWindow):
             row2.addWidget(btn)
         row2.addStretch()
         gg.addLayout(row2)
+
+        # 快速灵巧手（集成模式）
+        if HAND_OK:
+            row_hand = QHBoxLayout()
+            row_hand.addWidget(QLabel("手部:"))
+            for hname in ["张开", "握拳", "OK", "点赞", "点按"]:
+                btn = QPushButton(hname)
+                btn.setFixedWidth(48)
+                btn.setMinimumHeight(28)
+                btn.clicked.connect(lambda checked, n=hname: self._hand_set_preset("r", n))
+                row_hand.addWidget(btn)
+            row_hand.addStretch()
+            gg.addLayout(row_hand)
 
         # 快速语音
         row3 = QHBoxLayout()
@@ -1154,6 +1339,34 @@ class MainWindow(QMainWindow):
         gl.addWidget(scroll)
         layout.addWidget(grp)
 
+        # ---- 灵巧手集成 ----
+        if HAND_OK:
+            # 灵巧手状态
+            grp = QGroupBox("灵巧手 DDS")
+            gl = QHBoxLayout(grp)
+            self._btn_hand_status = QLabel("未就绪" if not self._hand_ready else "就绪")
+            self._btn_hand_status.setStyleSheet(
+                "color: #888;" if not self._hand_ready else "color: #27ae60; font-weight: bold;")
+            gl.addWidget(QLabel("状态:"))
+            gl.addWidget(self._btn_hand_status)
+            reinit_hand = QPushButton("重新初始化")
+            reinit_hand.clicked.connect(lambda: self._init_hand_dds(
+                self._nav_net_if.text().strip()))
+            gl.addWidget(reinit_hand)
+            gl.addStretch()
+            layout.addWidget(grp)
+
+            # 协同动作
+            grp = QGroupBox("协同动作（手臂 + 灵巧手）")
+            gl = QHBoxLayout(grp)
+            for aname, (_, hand_preset) in COORDINATED_ACTIONS.items():
+                cn = ACTION_CN.get(aname, aname)
+                btn = QPushButton(cn)
+                btn.clicked.connect(lambda checked, n=aname: self._g1_coordinated_action(n))
+                gl.addWidget(btn)
+            gl.addStretch()
+            layout.addWidget(grp)
+
         # TTS 语音
         grp = QGroupBox("语音播报 (TTS)")
         gl = QVBoxLayout(grp)
@@ -1225,6 +1438,729 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
         return tab
+
+    # ---- 灵巧手控制标签页（完整面板） ----
+    def _build_hand_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(6)
+
+        # ── 工具栏 ──
+        top = QHBoxLayout()
+        top.addWidget(QLabel("控制:"))
+        self._ht_lr_btn = QPushButton("右手")
+        self._ht_lr_btn.setCheckable(True)
+        self._ht_lr_btn.toggled.connect(
+            lambda c: self._ht_lr_btn.setText("左手" if c else "右手"))
+        top.addWidget(self._ht_lr_btn)
+
+        self._ht_link_btn = QPushButton("双手同步: 关")
+        self._ht_link_btn.setCheckable(True)
+        self._ht_link_btn.toggled.connect(
+            lambda c: self._ht_link_btn.setText(f"双手同步: {'开' if c else '关'}"))
+        top.addWidget(self._ht_link_btn)
+
+        top.addWidget(QLabel("  手势:"))
+        for pname in ("张开", "握拳", "指向", "OK", "点赞", "三指捏", "半开", "点按"):
+            btn = QPushButton(pname)
+            btn.setStyleSheet("font-size:11px; padding:2px 8px;")
+            btn.clicked.connect(lambda checked, n=pname: self._ht_preset(n))
+            top.addWidget(btn)
+        top.addStretch()
+
+        self._ht_status = QLabel("DDS: 未就绪")
+        self._ht_status.setStyleSheet("color:#f38ba8; font-weight:bold;")
+        top.addWidget(self._ht_status)
+        layout.addLayout(top)
+
+        # ── 双手面板 ──
+        hands = QHBoxLayout()
+        hands.setSpacing(8)
+
+        # 初始化 target 存储
+        self._ht_targets = {"l": [500]*6, "r": [500]*6}
+        self._ht_sliders = {"l": [], "r": []}   # [(slider, val_label, fb_label)]
+
+        for side, side_name in (("l", "左手"), ("r", "右手")):
+            grp = QGroupBox(side_name)
+            gl = QVBoxLayout(grp)
+            gl.setSpacing(2)
+            gl.setContentsMargins(6, 14, 6, 6)
+            rows = []
+            for i, fname in enumerate(["小指","无名指","中指","食指","拇指屈","拇指旋"]):
+                row = QHBoxLayout()
+                row.setSpacing(3)
+                lbl = QLabel(fname)
+                lbl.setFixedWidth(36)
+                lbl.setStyleSheet("font-size:10px; font-weight:bold;")
+                row.addWidget(lbl)
+
+                sld = QSlider(Qt.Horizontal)
+                sld.setRange(0, 1000)
+                sld.setValue(500)
+                sld.valueChanged.connect(lambda v, s=side, idx=i: self._ht_slider(s, idx, v))
+                row.addWidget(sld, 1)
+
+                vl = QLabel("500")
+                vl.setFixedWidth(30)
+                vl.setAlignment(Qt.AlignRight|Qt.AlignVCenter)
+                vl.setStyleSheet("font-size:10px; font-family:monospace;")
+                row.addWidget(vl)
+
+                fb_lbl = QLabel("--")
+                fb_lbl.setFixedWidth(30)
+                fb_lbl.setAlignment(Qt.AlignRight|Qt.AlignVCenter)
+                fb_lbl.setStyleSheet("font-size:10px; color:#a6e3a1;")
+                row.addWidget(fb_lbl)
+
+                gl.addLayout(row)
+                rows.append((sld, vl, fb_lbl))
+            self._ht_sliders[side] = rows
+
+            # 手部可视化（复用 HandCanvas）
+            if HAS_HAND_WIDGETS:
+                canvas = HandCanvas()
+                canvas.setFixedHeight(200)
+                gl.addWidget(canvas, 1)
+                self._ht_canvas = getattr(self, '_ht_canvas', {})
+                self._ht_canvas[side] = canvas
+
+            grp.setMinimumWidth(280)
+            hands.addWidget(grp)
+
+        layout.addLayout(hands, 1)
+
+        # ── 力传感器反馈 ──
+        fb_grp = QGroupBox("力传感器反馈")
+        fb_grid = QHBoxLayout(fb_grp)
+        self._ht_force_lbls = {"l": [], "r": []}
+        for side, sn in (("l", "左手"), ("r", "右手")):
+            col = QVBoxLayout()
+            col.addWidget(QLabel(sn))
+            for fname in ["小指","无名指","中指","食指","拇指屈","拇指旋"]:
+                lbl = QLabel(f"{fname}: --")
+                lbl.setStyleSheet("font-size:10px;")
+                col.addWidget(lbl)
+                self._ht_force_lbls[side].append(lbl)
+            fb_grid.addLayout(col)
+        fb_grid.addStretch()
+        layout.addWidget(fb_grp)
+
+        # ── 急停 ──
+        estop = QPushButton("🛑 紧急停止灵巧手")
+        estop.setStyleSheet("font-size:14px; font-weight:bold; background:#c0392b; color:#fff; padding:8px;")
+        estop.clicked.connect(self._ht_estop)
+        layout.addWidget(estop)
+
+        # ── 启动定时器（50ms 刷新 DDS 状态和 UI） ──
+        self._ht_timer = QTimer()
+        self._ht_timer.timeout.connect(self._ht_tick)
+        self._ht_timer.start(50)
+
+        return tab
+
+    def _ht_slider(self, side, idx, value):
+        """滑块拖动 → 更新 target → DDS 发布"""
+        self._ht_targets[side][idx] = value
+        # 更新本手数值标签
+        sld, vl, _ = self._ht_sliders[side][idx]
+        vl.setText(str(int(value)))
+        # 联动模式
+        if hasattr(self, '_ht_link_btn') and self._ht_link_btn.isChecked():
+            other = "r" if side == "l" else "l"
+            self._ht_targets[other][idx] = value
+            osld, ovl, _ = self._ht_sliders[other][idx]
+            osld.blockSignals(True)
+            osld.setValue(int(value))
+            osld.blockSignals(False)
+            ovl.setText(str(int(value)))
+        # 立即发布
+        self._ht_publish(side)
+        if hasattr(self, '_ht_link_btn') and self._ht_link_btn.isChecked():
+            other = "r" if side == "l" else "l"
+            self._ht_publish(other)
+
+    def _ht_publish(self, side):
+        """发布一侧手的 DDS 控制指令"""
+        if not self._hand_ready:
+            return
+        pub = self._hand_pub_r if side == "r" else self._hand_pub_l
+        if not pub:
+            return
+        try:
+            cmd = get_inspire_hand_ctrl()
+            cmd.mode = 0b0001
+            cmd.angle_set = [int(v) for v in self._ht_targets[side]]
+            pub.Write(cmd)
+        except Exception:
+            pass
+
+    def _ht_preset(self, name):
+        """在手势面板应用预设"""
+        if name not in HAND_PRESETS:
+            return
+        vals = HAND_PRESETS[name]
+        # 判断当前控制哪只手
+        is_left = hasattr(self, '_ht_lr_btn') and self._ht_lr_btn.isChecked()
+        if is_left:
+            sides = ("l",)
+        else:
+            sides = ("r",)
+        if hasattr(self, '_ht_link_btn') and self._ht_link_btn.isChecked():
+            sides = ("l", "r")
+
+        for side in sides:
+            self._ht_targets[side] = list(vals)
+            for i, (sld, vl, _) in enumerate(self._ht_sliders[side]):
+                sld.blockSignals(True)
+                sld.setValue(int(vals[i]))
+                sld.blockSignals(False)
+                vl.setText(str(int(vals[i])))
+            self._ht_publish(side)
+        self._log(f"[手势] {'左手' if is_left else '右手'} → {name}")
+
+    def _ht_tick(self):
+        """定时器刷新: 更新力反馈 UI + 可视化 + 发布当前 target"""
+        if not self._hand_ready:
+            if hasattr(self, '_ht_status'):
+                self._ht_status.setText("DDS: 未就绪")
+            return
+        self._ht_status.setText("DDS: 就绪")
+        self._ht_status.setStyleSheet("color:#a6e3a1; font-weight:bold;")
+
+        # 刷新力反馈
+        for side in ("l", "r"):
+            st = self._hand_state.get(side, {})
+            forces = st.get('force', [])
+            angles = st.get('angle', [])
+            for i in range(6):
+                # 力值
+                fv = int(forces[i]) if i < len(forces) else 0
+                lbl = self._ht_force_lbls[side][i]
+                lbl.setText(f"{['小指','无名指','中指','食指','拇指屈','拇指旋'][i]}: {max(0, fv)}")
+                # 角度反馈
+                if i < len(self._ht_sliders[side]):
+                    _, _, fb_lbl = self._ht_sliders[side][i]
+                    av = int(angles[i]) if i < len(angles) else 0
+                    fb_lbl.setText(str(av))
+
+            # 更新可视化
+            if HAS_HAND_WIDGETS and hasattr(self, '_ht_canvas'):
+                canvas = self._ht_canvas.get(side)
+                if canvas and angles:
+                    canvas.update_pos(angles)
+
+        # 持续发布 target（确保 DDS 到手部通路畅通）
+        for side in ("l", "r"):
+            self._ht_publish(side)
+
+    def _ht_estop(self):
+        """灵巧手急停：保持当前位置"""
+        for side in ("l", "r"):
+            st = self._hand_state.get(side, {})
+            angles = st.get('angle', [500]*6)
+            if len(angles) == 6:
+                self._ht_targets[side] = list(angles)
+                for i, (sld, vl, _) in enumerate(self._ht_sliders[side]):
+                    sld.blockSignals(True)
+                    sld.setValue(int(angles[i]))
+                    sld.blockSignals(False)
+                    vl.setText(str(int(angles[i])))
+                self._ht_publish(side)
+        self._log("[灵巧手] 急停")
+
+    # ================================================================
+    # G1 手臂控制 (rt/arm_sdk, 冻结初始腰位)
+    # ================================================================
+    def _arm_lowstate_cb(self, msg):
+        with self._arm_low_state_lock:
+            self._arm_low_state = msg
+        self._arm_low_state_event.set()
+
+    def _arm_current_lowstate(self):
+        with self._arm_low_state_lock:
+            return self._arm_low_state
+
+    def _arm_sdk_get_current_right_arm_q(self):
+        state = self._arm_current_lowstate()
+        if not state:
+            return None
+        return [float(state.motor_state[jid].q) for jid in G1_ARM_JOINT_IDS]
+
+    def _arm_sdk_prepare_cmd_from_lowstate(self):
+        """用当前 lowstate 填满整包 LowCmd，避免未写腰腿字段导致塌腰。"""
+        state = self._arm_current_lowstate()
+        if not state:
+            return False
+        cmd = unitree_hg_msg_dds__LowCmd_()
+        cmd.mode_pr = 0
+        cmd.mode_machine = state.mode_machine
+        right_arm = set(G1_ARM_JOINT_IDS)
+        for joint in G1JointIndex:
+            idx = int(joint)
+            motor = cmd.motor_cmd[idx]
+            motor.mode = 1
+            motor.q = float(state.motor_state[idx].q)
+            motor.dq = 0.0
+            motor.tau = 0.0
+            if idx in right_arm:
+                if joint in WRIST_MOTORS:
+                    motor.kp = 40.0
+                    motor.kd = 1.5
+                else:
+                    motor.kp = 80.0
+                    motor.kd = 3.0
+            elif joint in WEAK_MOTORS:
+                motor.kp = 80.0
+                motor.kd = 3.0
+            else:
+                motor.kp = 300.0
+                motor.kd = 3.0
+        cmd.motor_cmd[G1_ARM_SDK_ENABLE_JOINT].q = float(self._arm_sdk_weight)
+        with self._arm_sdk_cmd_lock:
+            self._arm_sdk_cmd = cmd
+        with self._arm_sdk_target_lock:
+            self._arm_sdk_current_cmd_q = [float(state.motor_state[jid].q) for jid in G1_ARM_JOINT_IDS]
+        return True
+
+    def _arm_sdk_clip_targets(self, targets):
+        max_step = max(self._arm_sdk_velocity_limit * self._arm_sdk_publish_dt, 1e-6)
+        next_q = []
+        for cur, tgt in zip(self._arm_sdk_current_cmd_q, targets):
+            delta = float(tgt) - float(cur)
+            if delta > max_step:
+                delta = max_step
+            elif delta < -max_step:
+                delta = -max_step
+            next_q.append(float(cur) + delta)
+        self._arm_sdk_current_cmd_q = next_q
+        return next_q
+
+    def _arm_sdk_publish_once(self):
+        if not self._arm_sdk_ready or not self._arm_sdk_pub:
+            return
+        try:
+            with self._arm_sdk_cmd_lock:
+                cmd = self._arm_sdk_cmd
+            if cmd is None:
+                return
+            with self._arm_sdk_target_lock:
+                targets = list(self._arm_sdk_targets)
+                weight = float(self._arm_sdk_weight)
+                clipped = self._arm_sdk_clip_targets(targets)
+            with self._arm_sdk_cmd_lock:
+                cmd.motor_cmd[G1_ARM_SDK_ENABLE_JOINT].q = weight
+                for i, jid in enumerate(G1_ARM_JOINT_IDS):
+                    motor = cmd.motor_cmd[jid]
+                    motor.q = float(clipped[i])
+                    motor.dq = 0.0
+                    motor.tau = 0.0
+                    motor.kp = G1_ARM_PARAMS[i]["kp"]
+                    motor.kd = G1_ARM_PARAMS[i]["kd"]
+                cmd.crc = self._arm_sdk_crc.Crc(cmd) if self._arm_sdk_crc else CRC().Crc(cmd)
+                self._arm_sdk_pub.Write(cmd)
+        except Exception as e:
+            self._log(f"[姿态] arm_sdk 发布异常: {e}")
+
+    def _arm_sdk_publish_loop(self):
+        while not self._arm_sdk_stop_event.is_set():
+            start = time.time()
+            self._arm_sdk_publish_once()
+            sleep_time = self._arm_sdk_publish_dt - (time.time() - start)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def _arm_sdk_start_publish_loop(self):
+        if self._arm_sdk_publish_thread and self._arm_sdk_publish_thread.is_alive():
+            return
+        self._arm_sdk_stop_event.clear()
+        self._arm_sdk_publish_thread = threading.Thread(
+            target=self._arm_sdk_publish_loop,
+            name="g1-nav-arm-sdk",
+            daemon=True,
+        )
+        self._arm_sdk_publish_thread.start()
+
+    def _arm_sdk_stop_publish_loop(self):
+        self._arm_sdk_stop_event.set()
+        th = self._arm_sdk_publish_thread
+        if th and th.is_alive():
+            th.join(timeout=1.0)
+        self._arm_sdk_publish_thread = None
+
+    def _arm_sdk_ramp_weight(self, start, end, seconds=1.0):
+        steps = max(1, int(seconds / 0.02))
+        for step in range(steps + 1):
+            ratio = step / steps
+            with self._arm_sdk_target_lock:
+                self._arm_sdk_weight = float(start + (end - start) * ratio)
+            self._arm_sdk_publish_once()
+            time.sleep(0.02)
+
+    def _arm_sdk_release(self):
+        try:
+            if self._arm_sdk_ready and self._arm_sdk_cmd is not None:
+                self._arm_sdk_ramp_weight(float(self._arm_sdk_weight), 0.0, seconds=1.0)
+        finally:
+            self._arm_sdk_stop_publish_loop()
+            self._arm_sdk_active = False
+            with self._arm_sdk_target_lock:
+                self._arm_sdk_weight = 0.0
+
+    def _arm_sdk_set_joints(self, angles):
+        """设置目标关节角度"""
+        with self._arm_sdk_target_lock:
+            for i in range(min(len(angles), 7)):
+                lo = G1_ARM_PARAMS[i]["min"]
+                hi = G1_ARM_PARAMS[i]["max"]
+                self._arm_sdk_targets[i] = max(lo, min(hi, float(angles[i])))
+
+    # ================================================================
+    # 姿态录制 / 回放系统
+    # ================================================================
+    def _pose_capture(self):
+        """捕获当前手臂+手的姿态 """
+        arm = list(self._arm_sdk_targets)
+        # 手：从 hand state 或当前 target 读取
+        hand_r = self._ht_targets.get("r", [500]*6) if hasattr(self, '_ht_targets') else [500]*6
+        return {"arm": arm, "hand_r": hand_r}
+
+    def _pose_save(self, name):
+        name = name.strip()
+        if not name:
+            self._log("[姿态] 名称不能为空")
+            return
+        pose = self._pose_capture()
+        pose["name"] = name
+        # 覆盖同名
+        for i, p in enumerate(self._poses):
+            if p["name"] == name:
+                self._poses[i] = pose
+                self._log(f"[姿态] 已更新: {name}")
+                self._pose_refresh_list()
+                return
+        self._poses.append(pose)
+        self._log(f"[姿态] 已保存: {name}")
+        self._pose_refresh_list()
+
+    def _pose_execute(self, idx):
+        if idx < 0 or idx >= len(self._poses):
+            return
+        pose = self._poses[idx]
+        name = pose.get("name", f"姿态{idx}")
+        # 必须在激活状态下执行
+        if not self._arm_sdk_active:
+            self._log("[姿态] 请先激活低阶控制再执行")
+            return
+        # 1. 设置手臂关节
+        self._arm_sdk_set_joints(pose.get("arm", [0.0]*7))
+        self._log(f"[姿态] 手臂: {name}")
+        # 2. 设置手部
+        hand = pose.get("hand_r", [500]*6)
+        if hasattr(self, '_ht_targets'):
+            self._ht_targets["r"] = list(hand)
+            self._ht_publish("r")
+            # 更新右手滑块 UI
+            if hasattr(self, '_ht_sliders') and "r" in self._ht_sliders:
+                for i, (sld, vl, _) in enumerate(self._ht_sliders["r"]):
+                    if i < len(hand):
+                        sld.blockSignals(True)
+                        sld.setValue(int(hand[i]))
+                        sld.blockSignals(False)
+                        vl.setText(str(int(hand[i])))
+            self._log(f"[姿态] 右手: {name}")
+        self._log(f"[姿态] 执行: {name}")
+
+    def _pose_delete(self, idx):
+        if 0 <= idx < len(self._poses):
+            name = self._poses[idx].get("name", "")
+            self._poses.pop(idx)
+            self._log(f"[姿态] 已删除: {name}")
+            self._pose_refresh_list()
+
+    def _pose_refresh_list(self):
+        """刷新姿态列表 UI"""
+        if not hasattr(self, '_pose_list'):
+            return
+        self._pose_list.clear()
+        for i, p in enumerate(self._poses):
+            arm_str = ", ".join(f"{a:.2f}" for a in p.get("arm", []))
+            hand_str = ", ".join(str(h) for h in p.get("hand_r", []))
+            self._pose_list.addItem(f"{i+1}. {p.get('name', '未命名')}  臂:[{arm_str}]  手:[{hand_str}]")
+
+    def _pose_export(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出姿态", os.path.expanduser("~/g1_poses.json"), "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._poses, f, ensure_ascii=False, indent=2)
+            self._log(f"[姿态] 已导出 {len(self._poses)} 个: {os.path.basename(path)}")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+
+    def _pose_import(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入姿态", os.path.expanduser("~"), "JSON (*.json)")
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                QMessageBox.warning(self, "格式错误", "需要 JSON 数组")
+                return
+            self._poses = data
+            self._pose_refresh_list()
+            self._log(f"[姿态] 已导入 {len(data)} 个姿态")
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", str(e))
+
+    # ---- 姿态编辑标签页 ----
+    def _build_pose_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(6)
+
+        # ── 手臂关节控制 ──
+        grp = QGroupBox("手臂关节 (arm_sdk 低阶控制)")
+        gl = QVBoxLayout(grp)
+        gl.setSpacing(2)
+
+        self._pose_arm_sliders = []  # (slider, val_label, min, max)
+        slider_rows = QHBoxLayout()
+        slider_col = QVBoxLayout()
+        val_col = QVBoxLayout()
+        val_col.setAlignment(Qt.AlignRight)
+        for i, jname in enumerate(G1_ARM_JOINT_NAMES):
+            row = QHBoxLayout()
+            row.setSpacing(3)
+            lbl = QLabel(jname)
+            lbl.setFixedWidth(40)
+            lbl.setStyleSheet("font-size:10px;")
+            row.addWidget(lbl)
+
+            # 滑块：弧度值映射到整数范围
+            lo, hi = G1_ARM_PARAMS[i]["min"], G1_ARM_PARAMS[i]["max"]
+            sld = QSlider(Qt.Horizontal)
+            sld.setRange(int(lo*100), int(hi*100))
+            sld.setValue(0)
+            sld.valueChanged.connect(lambda v, idx=i: self._pose_arm_slider(idx, v/100.0))
+            row.addWidget(sld, 1)
+
+            vl = QLabel("0.00")
+            vl.setFixedWidth(36)
+            vl.setAlignment(Qt.AlignRight|Qt.AlignVCenter)
+            vl.setStyleSheet("font-size:10px; font-family:monospace;")
+            row.addWidget(vl)
+            gl.addLayout(row)
+            self._pose_arm_sliders.append((sld, vl, lo, hi))
+
+        # 工具按钮
+        tool_row = QHBoxLayout()
+        self._pose_arm_activate = QPushButton("⚠ 激活臂控")
+        self._pose_arm_activate.setStyleSheet("font-weight:bold; color:#fff; background:#e67e22;")
+        self._pose_arm_activate.clicked.connect(self._pose_arm_activate_toggle)
+        tool_row.addWidget(self._pose_arm_activate)
+        btn_read = QPushButton("读取当前姿态")
+        btn_read.clicked.connect(self._pose_arm_read_current)
+        tool_row.addWidget(btn_read)
+        btn_zero = QPushButton("归零")
+        btn_zero.clicked.connect(self._pose_arm_zero)
+        tool_row.addWidget(btn_zero)
+        tool_row.addStretch()
+
+        self._pose_arm_status = QLabel("臂控: 未激活")
+        self._pose_arm_status.setStyleSheet("color:#f38ba8; font-size:10px;")
+        tool_row.addWidget(self._pose_arm_status)
+        gl.addLayout(tool_row)
+        layout.addWidget(grp)
+
+        # ── 灵巧手手势 ──
+        grp2 = QGroupBox("灵巧手手势（配合当前姿态）")
+        g2l = QVBoxLayout(grp2)
+        preset_row = QHBoxLayout()
+        for pname in ("张开", "握拳", "指向", "OK", "点赞", "三指捏", "半开", "点按"):
+            btn = QPushButton(pname)
+            btn.setStyleSheet("font-size:11px; padding:2px 8px;")
+            btn.clicked.connect(lambda checked, n=pname: self._pose_hand_preset(n))
+            preset_row.addWidget(btn)
+        preset_row.addStretch()
+        g2l.addLayout(preset_row)
+
+        # 当前手部状态简示
+        self._pose_hand_status = QLabel("右手: 500 500 500 500 500 500")
+        self._pose_hand_status.setStyleSheet("font-size:10px; color:#a6e3a1;")
+        g2l.addWidget(self._pose_hand_status)
+        layout.addWidget(grp2)
+
+        # ── 姿态录制 ──
+        grp3 = QGroupBox("姿态录制 / 回放")
+        g3l = QVBoxLayout(grp3)
+
+        save_row = QHBoxLayout()
+        save_row.addWidget(QLabel("名称:"))
+        self._pose_name_input = QLineEdit()
+        self._pose_name_input.setPlaceholderText("输入姿态名称…")
+        save_row.addWidget(self._pose_name_input, 1)
+        btn_save = QPushButton("保存姿态")
+        btn_save.clicked.connect(lambda: self._pose_save(self._pose_name_input.text()))
+        save_row.addWidget(btn_save)
+        g3l.addLayout(save_row)
+
+        # 姿态列表
+        self._pose_list = QListWidget()
+        self._pose_list.itemDoubleClicked.connect(lambda: self._pose_execute(self._pose_list.currentRow()))
+        g3l.addWidget(self._pose_list, 1)
+
+        list_btn_row = QHBoxLayout()
+        btn_play = QPushButton("▶ 执行")
+        btn_play.clicked.connect(lambda: self._pose_execute(self._pose_list.currentRow()))
+        list_btn_row.addWidget(btn_play)
+        btn_del = QPushButton("删除")
+        btn_del.clicked.connect(lambda: self._pose_delete(self._pose_list.currentRow()))
+        list_btn_row.addWidget(btn_del)
+        btn_export = QPushButton("导出 JSON")
+        btn_export.clicked.connect(self._pose_export)
+        list_btn_row.addWidget(btn_export)
+        btn_import = QPushButton("导入 JSON")
+        btn_import.clicked.connect(self._pose_import)
+        list_btn_row.addWidget(btn_import)
+        list_btn_row.addStretch()
+        g3l.addLayout(list_btn_row)
+        layout.addWidget(grp3, 1)
+
+        # ── 急停 ──
+        estop = QPushButton("🛑 紧急停止（释放 arm_sdk + 手部保持）")
+        estop.setStyleSheet("font-size:14px; font-weight:bold; background:#c0392b; color:#fff; padding:8px;")
+        estop.clicked.connect(self._pose_estop)
+        layout.addWidget(estop)
+
+        # 初始化姿态列表
+        self._poses = []
+        self._pose_refresh_list()
+
+        # 创建定时器（但不启动，等待用户点击"激活 arm_sdk 控制"）
+        self._arm_sdk_active = False
+        self._pose_timer = QTimer()
+        self._pose_timer.timeout.connect(self._pose_tick)
+        self._pose_timer.start(50)
+
+        return tab
+
+    def _pose_arm_slider(self, idx, val_rad):
+        """手臂滑块拖动 → 设置关节角度 → 发布 arm_sdk"""
+        if idx < len(G1_ARM_JOINT_IDS) and idx < len(self._arm_sdk_targets):
+            with self._arm_sdk_target_lock:
+                self._arm_sdk_targets[idx] = val_rad
+            self._pose_arm_sliders[idx][1].setText(f"{val_rad:.2f}")
+
+    def _pose_arm_read_current(self):
+        """从 lowstate 读取当前关节角度到滑块"""
+        state = self._arm_current_lowstate()
+        if not state:
+            self._log("[姿态] 无 lowstate 数据")
+            return
+        for i, jid in enumerate(G1_ARM_JOINT_IDS):
+            val = float(state.motor_state[jid].q)
+            with self._arm_sdk_target_lock:
+                if i < len(self._arm_sdk_targets):
+                    self._arm_sdk_targets[i] = val
+            if i < len(self._pose_arm_sliders):
+                sld, vl, lo, hi = self._pose_arm_sliders[i]
+                sld.blockSignals(True)
+                sld.setValue(int(val * 100))
+                sld.blockSignals(False)
+                vl.setText(f"{val:.2f}")
+        self._log("[姿态] 已读取当前关节角度")
+
+    def _pose_arm_activate_toggle(self):
+        """切换 arm_sdk 激活状态（xr 风格全关节初始化，仅更新右臂）"""
+        if not self._arm_sdk_ready:
+            self._log("[姿态] arm_sdk 未就绪（G1 未连接）")
+            return
+        if not self._arm_sdk_active:
+            if not self._arm_low_state_event.wait(timeout=2.0):
+                self._log("[姿态] 未收到 rt/lowstate，禁止激活臂控")
+                return
+            current = self._arm_sdk_get_current_right_arm_q()
+            if current is None:
+                self._log("[姿态] 无 lowstate 数据，禁止激活臂控")
+                return
+            with self._arm_sdk_target_lock:
+                self._arm_sdk_targets = list(current)
+                self._arm_sdk_weight = 0.0
+            for i, val in enumerate(current):
+                if i < len(self._pose_arm_sliders):
+                    sld, vl, lo, hi = self._pose_arm_sliders[i]
+                    sld.blockSignals(True)
+                    sld.setValue(int(val * 100))
+                    sld.blockSignals(False)
+                    vl.setText(f"{val:.2f}")
+            if not self._arm_sdk_prepare_cmd_from_lowstate():
+                self._log("[姿态] LowCmd 初始化失败，禁止激活臂控")
+                return
+            self._arm_sdk_active = True
+            self._arm_sdk_start_publish_loop()
+            self._arm_sdk_ramp_weight(0.0, 1.0, seconds=1.0)
+            self._pose_timer.start(50)
+            self._pose_arm_activate.setText("■ 停用臂控")
+            self._pose_arm_activate.setStyleSheet("font-weight:bold; color:#fff; background:#c0392b;")
+            self._log("[姿态] 臂控已激活（xr 风格全关节初始化，仅更新右臂）")
+        else:
+            self._arm_sdk_release()
+            self._pose_timer.start(50)
+            self._pose_arm_activate.setText("⚠ 激活臂控")
+            self._pose_arm_activate.setStyleSheet("font-weight:bold; color:#fff; background:#e67e22;")
+            self._log("[姿态] 臂控已停用，arm_sdk weight 已释放")
+
+    def _pose_arm_zero(self):
+        """手臂归零"""
+        self._arm_sdk_set_joints([0.0]*7)
+        for i, (sld, vl, lo, hi) in enumerate(self._pose_arm_sliders):
+            sld.blockSignals(True)
+            sld.setValue(0)
+            sld.blockSignals(False)
+            vl.setText("0.00")
+        self._log("[姿态] 手臂归零")
+
+    def _pose_hand_preset(self, name):
+        """在姿态编辑中应用手部预设"""
+        if name not in HAND_PRESETS:
+            return
+        vals = HAND_PRESETS[name]
+        if hasattr(self, '_ht_targets'):
+            self._ht_targets["r"] = list(vals)
+            self._ht_publish("r")
+        status = f"右手: {' '.join(str(v) for v in vals)}"
+        self._pose_hand_status.setText(status)
+        # 也更新手 tab 的滑块
+        if hasattr(self, '_ht_sliders') and "r" in self._ht_sliders:
+            for i, (sld, vl, _) in enumerate(self._ht_sliders["r"]):
+                if i < len(vals):
+                    sld.blockSignals(True)
+                    sld.setValue(int(vals[i]))
+                    sld.blockSignals(False)
+                    vl.setText(str(int(vals[i])))
+        self._log(f"[姿态] 手: {name}")
+
+    def _pose_tick(self):
+        """定时器：更新臂控状态；DDS 发布由 250Hz 后台线程负责。"""
+        if self._arm_sdk_ready and self._arm_sdk_active:
+            self._pose_arm_status.setText("臂控: 运行中")
+            self._pose_arm_status.setStyleSheet("color:#a6e3a1; font-size:10px;")
+        else:
+            self._pose_arm_status.setText("臂控: 未激活")
+            self._pose_arm_status.setStyleSheet("color:#f38ba8; font-size:10px;")
+
+    def _pose_estop(self):
+        """急停：停止低阶控制"""
+        self._arm_sdk_release()
+        if hasattr(self, '_pose_arm_activate'):
+            self._pose_arm_activate.setText("⚠ 激活臂控")
+            self._pose_arm_activate.setStyleSheet("font-weight:bold; color:#fff; background:#e67e22;")
+        self._log("[姿态] 急停（arm_sdk 已平滑释放）")
 
     # ---- 设置标签页 ----
     def _build_settings_tab(self):
@@ -1385,7 +2321,11 @@ class MainWindow(QMainWindow):
 
     def _on_g1_toggle(self):
         if self._g1_ready:
+            self._arm_sdk_release()
             self._g1_ready = False
+            self._arm_sdk_ready = False
+            self._arm_sdk_pub = None
+            self._arm_sdk_cmd = None
             self._btn_g1.setText("连接 G1")
             self._g1_label.setText("状态: 已断开")
             self._btn_nav_g1.setText("连接 G1")
@@ -1399,22 +2339,29 @@ class MainWindow(QMainWindow):
 
         net_if = self._nav_net_if.text().strip()
         try:
+            self._log(f"[G1] 初始化 DDS (net_if={net_if})…")
             ChannelFactoryInitialize(0, net_if)
+            self._log("[G1] LocoClient…")
             self._g1_loco = LocoClient()
             self._g1_loco.SetTimeout(10.0)
             self._g1_loco.Init()
             self._g1_loco.Start()
+            self._log("[G1] LocoClient 就绪")
             global _g1_loco_ref
             _g1_loco_ref = self._g1_loco
 
+            self._log("[G1] ArmActionClient…")
             self._g1_arm = G1ArmActionClient()
             self._g1_arm.SetTimeout(10.0)
             self._g1_arm.Init()
+            self._log("[G1] ArmActionClient 就绪")
 
+            self._log("[G1] AudioClient…")
             self._g1_audio = G1AudioClient()
             self._g1_audio.SetTimeout(10.0)
             self._g1_audio.Init()
             self._g1_audio.SetVolume(85)
+            self._log("[G1] AudioClient 就绪")
             # 修补 SDK bug：原代码 self.tts_index += self.tts_index 永远是 0
             import types
             _real_tts_index = [1]
@@ -1424,6 +2371,32 @@ class MainWindow(QMainWindow):
                 code, data = client_self._Call(1001, json.dumps(p))
                 return code
             self._g1_audio.TtsMaker = types.MethodType(_fixed_tts, self._g1_audio)
+
+            # ---- arm_sdk 初始化：命令包等待激活时从 lowstate 完整构造 ----
+            self._arm_sdk_ready = False
+            self._arm_sdk_targets = [0.0]*7
+            with self._arm_low_state_lock:
+                self._arm_low_state = None
+            self._arm_low_state_event.clear()
+            self._arm_sdk_pub = None
+            self._arm_sdk_cmd = None
+            self._arm_sdk_stop_event.set()
+            self._arm_sdk_publish_thread = None
+            self._arm_sdk_active = False
+            self._arm_sdk_weight = 0.0
+            if ARM_LOW_OK:
+                try:
+                    self._arm_sdk_pub = ChannelPublisher("rt/arm_sdk", LowCmd_)
+                    self._arm_sdk_pub.Init()
+                    self._lowstate_sub = ChannelSubscriber("rt/lowstate", LowState_)
+                    self._lowstate_sub.Init(self._arm_lowstate_cb, 10)
+                    self._arm_sdk_ready = True
+                    self._log("[G1] arm_sdk 就绪（激活时从 lowstate 完整初始化）")
+                except Exception as e:
+                    self._log(f"[G1] arm_sdk 失败: {e}")
+
+            # ---- 灵巧手 DDS 初始化（不阻塞 G1 连接） ----
+            self._init_hand_dds(net_if)
 
             self._g1_ready = True
             self._btn_g1.setText("断开 G1")
@@ -1596,6 +2569,7 @@ class MainWindow(QMainWindow):
         self._g1_move(0, 0, 0)
 
     def _emergency_stop(self):
+        self._arm_sdk_release()
         self._teleop_stop()
         if self._tour_running:
             self._tour_cancel()
@@ -1641,6 +2615,110 @@ class MainWindow(QMainWindow):
                 self._g1_audio.TtsMaker(text.strip(), 0) #0女声 1男声
             except Exception as e:
                 self._log(f"[语音] 失败: {e}")
+
+    # ---- 灵巧手控制 ----
+    def _init_hand_dds(self, net_if):
+        """初始化灵巧手 DDS publisher（G1 连接成功后调用）"""
+        if not HAND_OK:
+            self._log("[灵巧手] SDK 不可用，跳过初始化")
+            return
+        self._hand_ready = False
+        try:
+            self._hand_pub_r = ChannelPublisher("rt/inspire_hand/ctrl/r", _hand_ctrl_type)
+            self._hand_pub_r.Init()
+            self._hand_pub_l = ChannelPublisher("rt/inspire_hand/ctrl/l", _hand_ctrl_type)
+            self._hand_pub_l.Init()
+
+            # 状态订阅（用于力反馈）
+            self._hand_state = {"l": {}, "r": {}}
+            for _lr in ("l", "r"):
+                _sub = ChannelSubscriber(f"rt/inspire_hand/state/{_lr}", _hand_state_type)
+                _sub.Init(lambda msg, lr=_lr: self._hand_state_update(lr, msg), 10)
+
+            self._hand_ready = True
+            self._log("[灵巧手] DDS 已就绪（含状态订阅）")
+            self._hand_targets = {"l": [500]*6, "r": [500]*6}
+            if hasattr(self, '_btn_hand_status'):
+                self._btn_hand_status.setText("就绪")
+                self._btn_hand_status.setStyleSheet("color: #27ae60; font-weight: bold;")
+        except Exception as e:
+            self._log(f"[灵巧手] DDS 初始化失败: {e}")
+            self._hand_pub_r = None
+            self._hand_pub_l = None
+
+    def _hand_state_update(self, lr, msg):
+        """灵巧手状态回调"""
+        self._hand_state[lr] = {
+            'angle': list(msg.angle_act) if hasattr(msg, 'angle_act') else [],
+            'force': list(msg.force_act) if hasattr(msg, 'force_act') else [],
+            'pos': list(msg.pos_act) if hasattr(msg, 'pos_act') else [],
+        }
+
+    def _hand_set_preset(self, lr, preset_name):
+        """通过 DDS 发送灵巧手预设手势 (lr='l'或'r')"""
+        if not self._hand_ready:
+            return
+        if preset_name not in HAND_PRESETS:
+            self._log(f"[灵巧手] 未知手势: {preset_name}")
+            return
+        pub = self._hand_pub_r if lr == "r" else self._hand_pub_l
+        if not pub:
+            return
+        try:
+            cmd = get_inspire_hand_ctrl()
+            cmd.mode = 0b0001  # 角度模式
+            cmd.angle_set = [int(v) for v in HAND_PRESETS[preset_name]]
+            pub.Write(cmd)
+            self._log(f"[灵巧手] {'右手' if lr == 'r' else '左手'} → {preset_name}")
+        except Exception as e:
+            self._log(f"[灵巧手] 控制失败: {e}")
+
+    def _hand_set_angles(self, lr, angles):
+        """通过 DDS 发送自定义角度 (6 个 0-1000)"""
+        if not self._hand_ready or len(angles) != 6:
+            return
+        pub = self._hand_pub_r if lr == "r" else self._hand_pub_l
+        if not pub:
+            return
+        try:
+            cmd = get_inspire_hand_ctrl()
+            cmd.mode = 0b0001
+            cmd.angle_set = [int(v) for v in angles]
+            pub.Write(cmd)
+        except Exception:
+            pass
+
+    def _g1_coordinated_action(self, action_name):
+        """同时执行 G1 手臂动作 + 灵巧手手势（右手）"""
+        if action_name not in COORDINATED_ACTIONS:
+            self._g1_arm_action(action_name)
+            return
+
+        arm_act, hand_preset = COORDINATED_ACTIONS[action_name]
+        cn = ACTION_CN.get(arm_act, arm_act)
+
+        # 1. 执行 G1 手臂动作（与 FSM 模式无关，阻尼模式下也可执行）
+        if self._g1_ready and self._g1_arm:
+            found = False
+            for aname_str, aid_val in ARM_ACTIONS.items():
+                if aname_str == arm_act:
+                    try:
+                        self._g1_arm.ExecuteAction(aid_val)
+                        self._log(f"[协同] 手臂: {cn}")
+                        found = True
+                    except Exception as e:
+                        self._log(f"[协同] 手臂执行失败: {e}")
+                        self._log(f"[协同] 提示: 请检查 G1 是否已站立（点击「行走模式」），"
+                                  "吊装调试时也可尝试先切到行走模式再切回阻尼")
+                    break
+            if not found:
+                self._log(f"[协同] 未找到手臂动作: {arm_act}")
+        else:
+            self._log("[协同] G1 未连接或手臂不可用")
+
+        # 2. 灵巧手手势
+        self._hand_set_preset("r", hand_preset)
+        self._log(f"[协同] {cn} + {hand_preset}")
 
     def _on_tts(self):
         self._g1_speak(self._tts_input.text())
@@ -1773,10 +2851,7 @@ class MainWindow(QMainWindow):
         if 0 <= cur < len(self._waypoints):
             _, _, _, _, action, speech = self._waypoints[cur]
             if action and action != "无":
-                for aname_str, aid_val in ARM_ACTIONS.items():
-                    if aname_str == action:
-                        self._g1_api(lambda i=aid_val: self._g1_arm.ExecuteAction(i))
-                        break
+                self._g1_coordinated_action(action)
             if speech:
                 self._g1_speak(speech)
 
@@ -1844,6 +2919,13 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self._on_nav_stop()
+        # 停止灵巧手定时器
+        if hasattr(self, '_ht_timer') and self._ht_timer:
+            self._ht_timer.stop()
+        # 停止姿态定时器
+        if hasattr(self, '_pose_timer') and self._pose_timer:
+            self._pose_timer.stop()
+        self._arm_sdk_release()
         if self._ros_worker:
             self._ros_worker.stop()
             self._ros_worker.wait(2000)

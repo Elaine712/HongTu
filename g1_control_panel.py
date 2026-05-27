@@ -21,10 +21,17 @@ import math
 import os
 import queue
 import socket
+import sys
 import threading
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+for p in [os.path.join(BASE, "unitree_sdk2_python"),
+          os.path.join(BASE, "inspire_hand")]:
+    if os.path.isdir(p) and p not in sys.path:
+        sys.path.insert(0, p)
 
 ###############################################################################
 # ROS 导入
@@ -52,6 +59,15 @@ try:
 except ImportError:
     G1_AVAILABLE = False
     ARM_ACTION_MAP = {}
+
+try:
+    from g1_arm_hand_coordinator import ArmHandTrajectoryPlayer, TrajectoryStopped, load_action_names
+    COORD_AVAILABLE = True
+    COORD_ACTION_NAMES = load_action_names()
+except Exception as e:
+    COORD_AVAILABLE = False
+    COORD_ACTION_NAMES = []
+    COORD_IMPORT_ERROR = e
 
 ###############################################################################
 # 常量
@@ -101,6 +117,8 @@ class RobotBackend:
         self.loco = None
         self.arm = None
         self.audio = None
+        self.coordinator = None
+        self.coord_status = "未启动"
         self._g1_net_if = DEFAULT_NET_IF
 
         # 导航标记
@@ -233,6 +251,17 @@ class RobotBackend:
             self.audio.SetTimeout(10.0)
             self.audio.Init()
 
+            if COORD_AVAILABLE:
+                try:
+                    self.coordinator = ArmHandTrajectoryPlayer()
+                    self.coordinator.init()
+                    self.coord_status = "就绪"
+                except Exception as e:
+                    self.coordinator = None
+                    self.coord_status = f"不可用: {e}"
+            else:
+                self.coord_status = "不可用"
+
             self.g1_connected = True
             return True
         except Exception as e:
@@ -240,6 +269,8 @@ class RobotBackend:
             return False
 
     def g1_disconnect(self):
+        if self.coordinator:
+            self.coordinator.stop()
         self.g1_connected = False
 
     def g1_move(self, vx, vy, wz):
@@ -260,6 +291,61 @@ class RobotBackend:
             self.arm.ExecuteAction(action_id)
         except Exception:
             pass
+
+    def is_coord_running(self):
+        return bool(self.coordinator and self.coordinator.is_running())
+
+    def g1_play_coord_action(self, action_name):
+        if not self.g1_connected or not self.coordinator:
+            return False, "请先连接 G1，并确认协同模块可用"
+        if self.is_coord_running():
+            return False, "已有协同动作正在执行"
+        try:
+            # 保持高层运控 FSM=200，由机器人原运控继续负责站立/行走平衡。
+            self.loco.Start()
+            self.coord_status = f"执行: {action_name}"
+
+            def done_cb(error):
+                if isinstance(error, TrajectoryStopped):
+                    self.coord_status = "已停止"
+                elif error:
+                    self.coord_status = f"失败: {error}"
+                else:
+                    self.coord_status = "完成"
+
+            self.coordinator.play_builtin(action_name, done_cb=done_cb)
+            return True, "已开始"
+        except Exception as e:
+            self.coord_status = f"失败: {e}"
+            return False, str(e)
+
+    def g1_play_coord_file(self, path):
+        if not self.g1_connected or not self.coordinator:
+            return False, "请先连接 G1，并确认协同模块可用"
+        if self.is_coord_running():
+            return False, "已有协同动作正在执行"
+        try:
+            self.loco.Start()
+            self.coord_status = f"执行: {os.path.basename(path)}"
+
+            def done_cb(error):
+                if isinstance(error, TrajectoryStopped):
+                    self.coord_status = "已停止"
+                elif error:
+                    self.coord_status = f"失败: {error}"
+                else:
+                    self.coord_status = "完成"
+
+            self.coordinator.play_file(path, done_cb=done_cb)
+            return True, "已开始"
+        except Exception as e:
+            self.coord_status = f"失败: {e}"
+            return False, str(e)
+
+    def g1_stop_coord(self):
+        if self.coordinator:
+            self.coordinator.stop()
+            self.coord_status = "停止中"
 
     def g1_speak(self, text):
         if not self.g1_connected or not text.strip():
@@ -289,6 +375,8 @@ class RobotBackend:
         if not self.g1_connected:
             return
         try:
+            if fsm_id != 200:
+                self.g1_stop_coord()
             self.loco.SetFsmId(fsm_id)
         except Exception:
             pass
@@ -518,8 +606,8 @@ class ControlPanel(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("G1 机器人控制面板")
-        self.geometry("1200x800")
-        self.minsize(900, 600)
+        self.geometry("1320x820")
+        self.minsize(1060, 680)
 
         self.bot = RobotBackend()
         self.waypoints = []           # [(name, x, y, yaw, action, speech)]
@@ -540,10 +628,10 @@ class ControlPanel(tk.Tk):
         pw = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         pw.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        left = ttk.Frame(pw, width=400)
+        left = ttk.Frame(pw, width=500)
         right = ttk.Frame(pw)
-        pw.add(left, weight=0)
-        pw.add(right, weight=1)
+        pw.add(left, weight=1)
+        pw.add(right, weight=3)
 
         self._build_conn(left)
         self._build_teleop(left)
@@ -567,13 +655,15 @@ class ControlPanel(tk.Tk):
         f.pack(fill=tk.X, pady=2)
         r = ttk.Frame(f)
         r.pack(fill=tk.X)
-        ttk.Label(r, text="网卡:").pack(side=tk.LEFT)
+        ttk.Label(r, text="网卡").pack(side=tk.LEFT)
         self._net_if = tk.StringVar(value=DEFAULT_NET_IF)
-        ttk.Entry(r, textvariable=self._net_if, width=14).pack(side=tk.LEFT, padx=5)
-        self._btn_ros = ttk.Button(r, text="连接 ROS", command=self._toggle_ros)
+        ttk.Entry(r, textvariable=self._net_if, width=10).pack(side=tk.LEFT, padx=4)
+        self._btn_ros = ttk.Button(r, text="ROS", command=self._toggle_ros)
         self._btn_ros.pack(side=tk.LEFT, padx=2)
-        self._btn_g1 = ttk.Button(r, text="连接 G1", command=self._toggle_g1)
+        self._btn_g1 = ttk.Button(r, text="G1", command=self._toggle_g1)
         self._btn_g1.pack(side=tk.LEFT, padx=2)
+        self._conn_hint = ttk.Label(r, text="", foreground="#666")
+        self._conn_hint.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
 
     # ---- 遥控 ----
     def _build_teleop(self, parent):
@@ -582,7 +672,7 @@ class ControlPanel(tk.Tk):
 
         r = ttk.Frame(f)
         r.pack(fill=tk.X)
-        ttk.Label(r, text="速度:").pack(side=tk.LEFT)
+        ttk.Label(r, text="速度").pack(side=tk.LEFT)
         self._spd = tk.DoubleVar(value=0.3)
         sc = ttk.Scale(r, from_=0.05, to=1.0, variable=self._spd,
                         orient=tk.HORIZONTAL, length=150)
@@ -594,19 +684,19 @@ class ControlPanel(tk.Tk):
         # 方向按钮
         g = ttk.Frame(f)
         g.pack(pady=5)
-        ttk.Button(g, text="↑\nW", width=6,
+        ttk.Button(g, text="↑\nW", width=7,
                    command=lambda: self._teleop_start(1, 0, 0)).grid(row=0, column=1, padx=2, pady=2)
-        ttk.Button(g, text="←\nA", width=6,
+        ttk.Button(g, text="←\nA", width=7,
                    command=lambda: self._teleop_start(0, 0, 1)).grid(row=1, column=0, padx=2, pady=2)
-        ttk.Button(g, text="STOP\n空格", width=6,
+        ttk.Button(g, text="STOP\n空格", width=7,
                    command=self._teleop_stop).grid(row=1, column=1, padx=2, pady=2)
-        ttk.Button(g, text="→\nD", width=6,
+        ttk.Button(g, text="→\nD", width=7,
                    command=lambda: self._teleop_start(0, 0, -1)).grid(row=1, column=2, padx=2, pady=2)
-        ttk.Button(g, text="↓\nS", width=6,
+        ttk.Button(g, text="↓\nS", width=7,
                    command=lambda: self._teleop_start(-1, 0, 0)).grid(row=2, column=1, padx=2, pady=2)
-        ttk.Button(g, text="←横\nQ", width=6,
+        ttk.Button(g, text="←横\nQ", width=7,
                    command=lambda: self._teleop_start(0, 1, 0)).grid(row=2, column=0, padx=2, pady=2)
-        ttk.Button(g, text="→横\nE", width=6,
+        ttk.Button(g, text="→横\nE", width=7,
                    command=lambda: self._teleop_start(0, -1, 0)).grid(row=2, column=2, padx=2, pady=2)
 
         self.bind("<KeyPress-w>", lambda e: self._teleop_start(1, 0, 0))
@@ -630,51 +720,69 @@ class ControlPanel(tk.Tk):
 
         # FSM
         r = ttk.Frame(f)
-        r.pack(fill=tk.X)
-        ttk.Label(r, text="FSM:").pack(side=tk.LEFT)
-        for txt, fid in [("行走", 200), ("阻尼", 1), ("坐下", 3)]:
-            ttk.Button(r, text=txt, width=5,
-                       command=lambda i=fid: self.bot.g1_set_fsm(i)).pack(side=tk.LEFT, padx=1)
-        ttk.Button(r, text="站起", width=5, command=self.bot.g1_stand_up).pack(side=tk.LEFT, padx=1)
+        r.pack(fill=tk.X, pady=1)
+        ttk.Label(r, text="FSM", width=5).grid(row=0, column=0, sticky="w", padx=(0, 4))
+        for idx, (txt, fid) in enumerate([("行走", 200), ("阻尼", 1), ("坐下", 3)]):
+            ttk.Button(r, text=txt, width=6,
+                       command=lambda i=fid: self.bot.g1_set_fsm(i)).grid(row=0, column=idx + 1, padx=1, pady=1)
+        ttk.Button(r, text="站起", width=6, command=self.bot.g1_stand_up).grid(row=0, column=4, padx=1, pady=1)
 
         # 手臂动作
         r = ttk.Frame(f)
-        r.pack(fill=tk.X, pady=2)
-        ttk.Label(r, text="手臂:").pack(side=tk.LEFT)
+        r.pack(fill=tk.X, pady=1)
+        ttk.Label(r, text="手臂", width=5).grid(row=0, column=0, sticky="nw", padx=(0, 4), pady=2)
         # 常用动作
         common = [("挥手", "face wave"), ("鼓掌", "clap"), ("拥抱", "hug"),
                   ("比心", "heart"), ("举手", "right hand up"), ("拒绝", "reject"),
                   ("握手", "shake hand"), ("展示", "x-ray")]
-        for txt, an in common:
-            ttk.Button(r, text=txt, width=5,
-                       command=lambda n=an: self._do_arm(n)).pack(side=tk.LEFT, padx=1)
+        for idx, (txt, an) in enumerate(common):
+            ttk.Button(r, text=txt, width=7,
+                       command=lambda n=an: self._do_arm(n)).grid(
+                           row=idx // 4, column=idx % 4 + 1, padx=1, pady=1)
+
+        # 手臂 + 灵巧手协同动作（保持运控 FSM=200，只接管 arm_sdk）
+        r = ttk.Frame(f)
+        r.pack(fill=tk.X, pady=1)
+        ttk.Label(r, text="协同", width=5).grid(row=0, column=0, sticky="w", padx=(0, 4))
+        self._coord_act = tk.StringVar(value=COORD_ACTION_NAMES[0] if COORD_ACTION_NAMES else "不可用")
+        self._coord_combo = ttk.Combobox(
+            r, textvariable=self._coord_act, values=COORD_ACTION_NAMES,
+            width=16, state="readonly" if COORD_ACTION_NAMES else "disabled")
+        self._coord_combo.grid(row=0, column=1, columnspan=2, sticky="ew", padx=1, pady=1)
+        ttk.Button(r, text="执行", width=7, command=self._do_coord).grid(row=0, column=3, padx=1, pady=1)
+        ttk.Button(r, text="加载JSON", width=9, command=self._coord_load).grid(row=1, column=1, padx=1, pady=1)
+        ttk.Button(r, text="停止", width=7, command=self._coord_stop).grid(row=1, column=2, padx=1, pady=1)
+        r.columnconfigure(1, weight=1)
 
         # TTS
         r = ttk.Frame(f)
-        r.pack(fill=tk.X, pady=2)
-        ttk.Label(r, text="语音:").pack(side=tk.LEFT)
+        r.pack(fill=tk.X, pady=1)
+        ttk.Label(r, text="语音", width=5).grid(row=0, column=0, sticky="w", padx=(0, 4))
         self._tts = tk.StringVar()
-        ttk.Entry(r, textvariable=self._tts, width=22).pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
-        ttk.Button(r, text="播报", command=self._do_tts).pack(side=tk.LEFT)
+        ttk.Entry(r, textvariable=self._tts, width=20).grid(row=0, column=1, sticky="ew", padx=1, pady=1)
+        ttk.Button(r, text="播报", width=7, command=self._do_tts).grid(row=0, column=2, padx=1, pady=1)
+        r.columnconfigure(1, weight=1)
 
         # LED
         r = ttk.Frame(f)
-        r.pack(fill=tk.X, pady=2)
-        ttk.Label(r, text="LED:").pack(side=tk.LEFT)
-        for txt, r_, g_, b_ in [("红", 255, 0, 0), ("绿", 0, 255, 0),
-                                 ("蓝", 0, 0, 255), ("白", 255, 255, 255),
-                                 ("关", 0, 0, 0)]:
-            ttk.Button(r, text=txt, width=3,
-                       command=lambda rr=r_, gg=g_, bb=b_: self.bot.g1_led(rr, gg, bb)).pack(side=tk.LEFT, padx=1)
+        r.pack(fill=tk.X, pady=1)
+        ttk.Label(r, text="LED", width=5).grid(row=0, column=0, sticky="w", padx=(0, 4))
+        for idx, (txt, r_, g_, b_) in enumerate([("红", 255, 0, 0), ("绿", 0, 255, 0),
+                                                 ("蓝", 0, 0, 255), ("白", 255, 255, 255),
+                                                 ("关", 0, 0, 0)]):
+            ttk.Button(r, text=txt, width=5,
+                       command=lambda rr=r_, gg=g_, bb=b_: self.bot.g1_led(rr, gg, bb)).grid(
+                           row=0, column=idx + 1, padx=1, pady=1)
 
         # 音量
         r = ttk.Frame(f)
-        r.pack(fill=tk.X, pady=2)
-        ttk.Label(r, text="音量:").pack(side=tk.LEFT)
+        r.pack(fill=tk.X, pady=1)
+        ttk.Label(r, text="音量", width=5).grid(row=0, column=0, sticky="w", padx=(0, 4))
         self._vol = tk.IntVar(value=50)
         ttk.Scale(r, from_=0, to=100, variable=self._vol,
                   orient=tk.HORIZONTAL, length=100,
-                  command=lambda v: self.bot.g1_volume(int(float(v)))).pack(side=tk.LEFT, padx=5)
+                  command=lambda v: self.bot.g1_volume(int(float(v)))).grid(row=0, column=1, sticky="ew", padx=1)
+        r.columnconfigure(1, weight=1)
 
     # ---- 航点 ----
     def _build_wp(self, parent):
@@ -724,10 +832,12 @@ class ControlPanel(tk.Tk):
         self._lbl_ros.pack(side=tk.LEFT, padx=5)
         self._lbl_g1 = ttk.Label(bar, text="G1: 未连接", width=15)
         self._lbl_g1.pack(side=tk.LEFT, padx=5)
-        self._lbl_pose = ttk.Label(bar, text="位姿: ---", width=35)
+        self._lbl_pose = ttk.Label(bar, text="位姿: ---", width=28)
         self._lbl_pose.pack(side=tk.LEFT, padx=5)
-        self._lbl_nav = ttk.Label(bar, text="导航: 空闲", width=18)
+        self._lbl_nav = ttk.Label(bar, text="导航: 空闲", width=14)
         self._lbl_nav.pack(side=tk.LEFT, padx=5)
+        self._lbl_coord = ttk.Label(bar, text="协同: ---")
+        self._lbl_coord.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
 
     # ========================================================================
     # 回调
@@ -735,19 +845,19 @@ class ControlPanel(tk.Tk):
     def _toggle_ros(self):
         if self.bot.ros_connected:
             self.bot.ros_connected = False
-            self._btn_ros.config(text="连接 ROS")
+            self._btn_ros.config(text="ROS")
         else:
             if self.bot.ros_connect():
-                self._btn_ros.config(text="断开 ROS")
+                self._btn_ros.config(text="断开ROS")
 
     def _toggle_g1(self):
         if self.bot.g1_connected:
             self.bot.g1_disconnect()
-            self._btn_g1.config(text="连接 G1")
+            self._btn_g1.config(text="G1")
         else:
             self.bot._g1_net_if = self._net_if.get()
             if self.bot.g1_connect():
-                self._btn_g1.config(text="断开 G1")
+                self._btn_g1.config(text="断开G1")
 
     def _teleop_start(self, vxd, vyd, wzd):
         s = self._spd.get()
@@ -764,6 +874,7 @@ class ControlPanel(tk.Tk):
         self.bot.g1_stop()
 
     def _emergency_stop(self):
+        self.bot.g1_stop_coord()
         self._teleop_stop()
         if self._tour_run:
             self._nav_cancel()
@@ -775,10 +886,39 @@ class ControlPanel(tk.Tk):
             self._teleop_stop()
 
     def _do_arm(self, name):
+        if self.bot.is_coord_running():
+            messagebox.showwarning("提示", "协同动作执行中，请先停止后再执行预设手臂动作")
+            return
         for aid, aname in ARM_ACTION_MAP.items():
             if aname == name:
                 self.bot.g1_action(aid)
                 break
+
+    def _do_coord(self):
+        if not COORD_AVAILABLE:
+            messagebox.showerror("协同模块不可用", str(globals().get("COORD_IMPORT_ERROR", "")))
+            return
+        name = self._coord_act.get()
+        ok, msg = self.bot.g1_play_coord_action(name)
+        if not ok:
+            messagebox.showwarning("协同动作", msg)
+
+    def _coord_load(self):
+        if not COORD_AVAILABLE:
+            messagebox.showerror("协同模块不可用", str(globals().get("COORD_IMPORT_ERROR", "")))
+            return
+        path = filedialog.askopenfilename(
+            title="加载协同动作",
+            initialdir=os.path.expanduser("~"),
+            filetypes=[("JSON", "*.json"), ("所有", "*.*")])
+        if not path:
+            return
+        ok, msg = self.bot.g1_play_coord_file(path)
+        if not ok:
+            messagebox.showwarning("协同动作", msg)
+
+    def _coord_stop(self):
+        self.bot.g1_stop_coord()
 
     def _do_tts(self):
         txt = self._tts.get().strip()
@@ -910,6 +1050,7 @@ class ControlPanel(tk.Tk):
         x, y, yaw = self.bot.robot_pose
         self._lbl_pose.config(text=f"位姿: ({x:.2f}, {y:.2f}, {math.degrees(yaw):.0f}°)")
         self._lbl_nav.config(text=f"导航: {self.bot.nav_status}")
+        self._lbl_coord.config(text=f"协同: {self.bot.coord_status}")
         self.after(300, self._refresh)
 
     # ---- 关闭 ----

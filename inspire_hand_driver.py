@@ -18,6 +18,8 @@ def main():
     parser.add_argument("--device-id", type=int, default=None,
                         help="Modbus device ID (默认: l=2, r=1)")
     parser.add_argument("--tcp-ip", default=None, help="使用 TCP 而非串口")
+    parser.add_argument("--network", default=None,
+                        help="DDS 网卡名称 (与 G1 导航面板的网卡一致，如 eno1)")
     args = parser.parse_args()
 
     if args.device_id is None:
@@ -36,6 +38,7 @@ def main():
         use_serial=use_serial,
         serial_port=args.serial,
         ip=args.tcp_ip,
+        network=args.network,
         states_structure=states_structure,
         initDDS=True,
     )
