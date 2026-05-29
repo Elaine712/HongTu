@@ -1672,19 +1672,17 @@ class MainWindow(QMainWindow):
             self._ht_publish(side)
 
     def _ht_estop(self):
-        """灵巧手急停：保持当前位置"""
+        """灵巧手急停：双手全部张开"""
+        open_vals = HAND_PRESETS["张开"]
         for side in ("l", "r"):
-            st = self._hand_state.get(side, {})
-            angles = st.get('angle', [500]*6)
-            if len(angles) == 6:
-                self._ht_targets[side] = list(angles)
-                for i, (sld, vl, _) in enumerate(self._ht_sliders[side]):
-                    sld.blockSignals(True)
-                    sld.setValue(int(angles[i]))
-                    sld.blockSignals(False)
-                    vl.setText(str(int(angles[i])))
-                self._ht_publish(side)
-        self._log("[灵巧手] 急停")
+            self._ht_targets[side] = list(open_vals)
+            for i, (sld, vl, _) in enumerate(self._ht_sliders[side]):
+                sld.blockSignals(True)
+                sld.setValue(open_vals[i])
+                sld.blockSignals(False)
+                vl.setText(str(open_vals[i]))
+            self._ht_publish(side)
+        self._log("[灵巧手] 急停 → 双手张开")
 
     # ================================================================
     # G1 手臂控制 (rt/arm_sdk, 冻结初始腰位)
