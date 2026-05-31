@@ -104,6 +104,14 @@ try:
 except Exception:
     HAS_HAND_WIDGETS = False
 
+try:
+    from g1_remote_client import G1RemoteClient, G1RemoteError
+    REMOTE_G1_OK = True
+except Exception:
+    G1RemoteClient = None
+    G1RemoteError = Exception
+    REMOTE_G1_OK = False
+
 # 英文动作名 → 中文显示名
 ACTION_CN = {
     "face wave": "挥手",
@@ -827,6 +835,9 @@ class MainWindow(QMainWindow):
         self._g1_arm = None
         self._g1_audio = None
         self._g1_ready = False
+        self._g1_remote_url = os.environ.get("HONGTU_G1_BACKEND_URL", "").strip()
+        self._g1_remote = None
+        self._g1_remote_mode = bool(self._g1_remote_url)
         self._hand_pub_l = None
         self._hand_pub_r = None
         self._hand_ready = False
@@ -943,7 +954,10 @@ class MainWindow(QMainWindow):
             "本体部署推荐填写 auto。手动连接时填写 G1 本体上的 DDS 网卡名，"
             "不是 PC 的网卡名；常见为 eth0，老版/PC 有线为 eno1。"
         )
-        self._nav_net_if.setFixedWidth(96)
+        if self._g1_remote_mode:
+            self._nav_net_if.setText(self._g1_remote_url)
+            self._nav_net_if.setToolTip("远程后台模式：这里显示 G1 本体 HTTP 服务地址")
+        self._nav_net_if.setFixedWidth(220 if self._g1_remote_mode else 96)
         toolbar.addWidget(self._nav_net_if)
 
         self._btn_g1 = QPushButton("连接 G1")
@@ -1336,7 +1350,7 @@ class MainWindow(QMainWindow):
             if fid == -1:
                 btn.clicked.connect(self._g1_stand)
             else:
-                btn.clicked.connect(lambda checked, f=fid: self._g1_fsm_api(lambda: self._g1_loco.SetFsmId(f)))
+                btn.clicked.connect(lambda checked, f=fid: self._g1_set_fsm(f))
             gl.addWidget(btn)
         gl.addStretch()
         layout.addWidget(grp)
@@ -1462,15 +1476,14 @@ class MainWindow(QMainWindow):
                 QPushButton:hover {{ border: 2px solid #e94560; background: {bg}; }}
                 QPushButton:pressed {{ background: {bg}; border: 2px solid #fff; }}
             """)
-            btn.clicked.connect(lambda checked, rr=r, gg=g, bb=b: self._g1_api(
-                lambda: self._g1_audio.LedControl(rr, gg, bb)))
+            btn.clicked.connect(lambda checked, rr=r, gg=g, bb=b: self._g1_led(rr, gg, bb))
             gl.addWidget(btn)
         gl.addStretch()
         gl.addWidget(QLabel("音量:"))
         self._vol_slider = QSlider(Qt.Horizontal)
         self._vol_slider.setRange(0, 100)
         self._vol_slider.setValue(100)
-        self._vol_slider.valueChanged.connect(lambda v: self._g1_api(lambda: self._g1_audio.SetVolume(v)))
+        self._vol_slider.valueChanged.connect(self._g1_set_volume)
         gl.addWidget(self._vol_slider)
         layout.addWidget(grp)
 
@@ -1836,6 +1849,15 @@ class MainWindow(QMainWindow):
             time.sleep(0.02)
 
     def _arm_sdk_release(self):
+        if self._g1_remote_mode and self._g1_remote:
+            try:
+                self._g1_remote.arm_release()
+            except Exception as e:
+                self._log(f"[姿态] 远程释放 arm_sdk 失败: {e}")
+            self._arm_sdk_active = False
+            with self._arm_sdk_target_lock:
+                self._arm_sdk_weight = 0.0
+            return
         try:
             if self._arm_sdk_ready and self._arm_sdk_cmd is not None:
                 self._arm_sdk_ramp_weight(float(self._arm_sdk_weight), 0.0, seconds=1.0)
@@ -1874,6 +1896,12 @@ class MainWindow(QMainWindow):
                 lo = G1_ARM_PARAMS[i]["min"]
                 hi = G1_ARM_PARAMS[i]["max"]
                 self._arm_sdk_targets[i] = max(lo, min(hi, float(target[i])))
+            remote_targets = list(self._arm_sdk_targets)
+        if self._g1_remote_mode and self._g1_remote and self._arm_sdk_active:
+            try:
+                self._g1_remote.arm_joints(remote_targets)
+            except Exception as e:
+                self._log(f"[姿态] 远程关节设置失败: {e}")
 
     def _normalize_arm_pose(self, angles):
         """兼容旧版 7 关节右臂姿态；新版使用 14 关节双臂姿态。"""
@@ -2176,16 +2204,29 @@ class MainWindow(QMainWindow):
                 self._arm_sdk_motion_start_error = max(
                     [abs(float(t) - float(c)) for t, c in zip(self._arm_sdk_targets, current)] + [0.0]
                 )
+                remote_targets = list(self._arm_sdk_targets)
             self._pose_arm_sliders[idx][1].setText(f"{val_rad:.2f}")
+            if self._g1_remote_mode and self._g1_remote and self._arm_sdk_active:
+                try:
+                    self._g1_remote.arm_joints(remote_targets)
+                except Exception as e:
+                    self._log(f"[姿态] 远程滑块发送失败: {e}")
 
     def _pose_arm_read_current(self):
         """从 lowstate 读取当前关节角度到滑块"""
-        state = self._arm_current_lowstate()
-        if not state:
-            self._log("[姿态] 无 lowstate 数据")
-            return
-        for i, jid in enumerate(G1_ARM_JOINT_IDS):
-            val = float(state.motor_state[jid].q)
+        if self._g1_remote_mode and self._g1_remote:
+            try:
+                values = self._g1_remote.arm_current().get("data", {}).get("joints", [])
+            except Exception as e:
+                self._log(f"[姿态] 远程读取失败: {e}")
+                return
+        else:
+            state = self._arm_current_lowstate()
+            if not state:
+                self._log("[姿态] 无 lowstate 数据")
+                return
+            values = [float(state.motor_state[jid].q) for jid in G1_ARM_JOINT_IDS]
+        for i, val in enumerate(values[:G1_ARM_DOF]):
             with self._arm_sdk_target_lock:
                 if i < len(self._arm_sdk_targets):
                     self._arm_sdk_targets[i] = val
@@ -2203,6 +2244,42 @@ class MainWindow(QMainWindow):
         """切换 arm_sdk 激活状态（xr 风格全关节初始化，更新双臂）"""
         if not self._arm_sdk_ready:
             self._log("[姿态] arm_sdk 未就绪（G1 未连接）")
+            return
+        if self._g1_remote_mode and self._g1_remote:
+            if not self._arm_sdk_active:
+                try:
+                    current = self._g1_remote.arm_activate().get("data", {}).get("joints", [])
+                except Exception as e:
+                    self._log(f"[姿态] 远程激活失败: {e}")
+                    return
+                if not current:
+                    self._log("[姿态] 远程未返回关节角，禁止激活")
+                    return
+                with self._arm_sdk_target_lock:
+                    self._arm_sdk_targets = list(current[:G1_ARM_DOF])
+                    self._arm_sdk_current_cmd_q = list(current[:G1_ARM_DOF])
+                    self._arm_sdk_motion_start_error = 0.0
+                    self._arm_sdk_weight = 1.0
+                for i, val in enumerate(current[:G1_ARM_DOF]):
+                    if i < len(self._pose_arm_sliders):
+                        sld, vl, lo, hi = self._pose_arm_sliders[i]
+                        sld.blockSignals(True)
+                        sld.setValue(int(float(val) * 100))
+                        sld.blockSignals(False)
+                        vl.setText(f"{float(val):.2f}")
+                self._arm_sdk_active = True
+                self._pose_timer.start(50)
+                self._pose_arm_activate.setText("■ 停用臂控")
+                self._pose_arm_activate.setStyleSheet("font-weight:bold; color:#fff; background:#c0392b;")
+                self._log("[姿态] 远程臂控已激活")
+            else:
+                self._arm_sdk_release()
+                if hasattr(self, '_pose_arm_progress'):
+                    self._pose_arm_progress.setValue(0)
+                self._pose_timer.start(50)
+                self._pose_arm_activate.setText("⚠ 激活臂控")
+                self._pose_arm_activate.setStyleSheet("font-weight:bold; color:#fff; background:#e67e22;")
+                self._log("[姿态] 远程臂控已停用")
             return
         if not self._arm_sdk_active:
             if not self._arm_low_state_event.wait(timeout=2.0):
@@ -2469,6 +2546,30 @@ class MainWindow(QMainWindow):
             self._g1_label.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px 10px; color: #888;")
             self._status_g1.setText("G1: 未连接")
             return
+        if self._g1_remote_mode:
+            if not REMOTE_G1_OK:
+                QMessageBox.warning(self, "远程客户端不可用", "g1_remote_client.py 未加载")
+                return
+            url = self._g1_remote_url
+            if self._nav_net_if.text().strip().startswith("http"):
+                url = self._nav_net_if.text().strip()
+                self._g1_remote_url = url
+            try:
+                self._log(f"[G1远程] 连接后台服务: {url}")
+                self._g1_remote = G1RemoteClient(url, timeout=3.0)
+                status = self._g1_remote.connect().get("data", {})
+                self._g1_ready = True
+                self._arm_sdk_ready = bool(status.get("arm_ready", True))
+                self._hand_ready = bool(status.get("hand_ready", False))
+                self._btn_g1.setText("断开 G1")
+                self._g1_label.setText("G1: 远程已连接")
+                self._g1_label.setStyleSheet("font-size: 13px; font-weight: bold; padding: 4px 10px; color: #27ae60;")
+                self._status_g1.setText("G1: 远程已连接")
+                self._log("[G1远程] 连接成功，本地 GUI 中文输入保持 PC 输入法")
+            except Exception as e:
+                QMessageBox.warning(self, "G1 远程连接失败", str(e))
+                self._log(f"[G1远程] 连接失败: {e}")
+            return
         if not G1_OK:
             QMessageBox.warning(self, "SDK 不可用", "unitree_sdk2py 未安装")
             return
@@ -2575,6 +2676,12 @@ class MainWindow(QMainWindow):
         if not self._has_active_goal:
             return  # 没有导航目标时不转发，防止启动时误触发
         try:
+            if self._g1_remote_mode and self._g1_remote:
+                if abs(vx) < 0.001 and abs(vy) < 0.001 and abs(wz) < 0.001:
+                    self._g1_remote.stop()
+                else:
+                    self._g1_remote.move(vx, vy, wz, continuous=True)
+                return
             if abs(vx) < 0.001 and abs(vy) < 0.001 and abs(wz) < 0.001:
                 self._g1_loco.StopMove()
             else:
@@ -2721,6 +2828,34 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _g1_set_fsm(self, fsm_id):
+        self._ensure_arm_sdk_released("切换 FSM 模式前")
+        if self._g1_remote_mode and self._g1_remote:
+            try:
+                self._g1_remote.fsm(fsm_id)
+            except Exception as e:
+                self._log(f"[G1远程] FSM 切换失败: {e}")
+            return
+        self._g1_api(lambda: self._g1_loco.SetFsmId(fsm_id))
+
+    def _g1_set_volume(self, value):
+        if self._g1_remote_mode and self._g1_remote:
+            try:
+                self._g1_remote.volume(value)
+            except Exception as e:
+                self._log(f"[G1远程] 音量设置失败: {e}")
+            return
+        self._g1_api(lambda: self._g1_audio.SetVolume(value))
+
+    def _g1_led(self, r, g, b):
+        if self._g1_remote_mode and self._g1_remote:
+            try:
+                self._g1_remote.led(r, g, b)
+            except Exception as e:
+                self._log(f"[G1远程] LED 设置失败: {e}")
+            return
+        self._g1_api(lambda: self._g1_audio.LedControl(r, g, b))
+
     def _g1_fsm_api(self, func):
         self._ensure_arm_sdk_released("切换 FSM 模式前")
         self._g1_api(func)
@@ -2734,12 +2869,22 @@ class MainWindow(QMainWindow):
                 self._log("[遥控] G1 未连接，点击“连接 G1”或等待本体模式自动连接")
             return
         try:
+            if self._g1_remote_mode and self._g1_remote:
+                self._g1_remote.move(vx, vy, wz, continuous=False)
+                return
             self._g1_loco.Move(vx, vy, wz, continous_move=False)
         except Exception as e:
             self._log(f"[遥控] 发送移动失败: {e}")
 
     def _g1_arm_action(self, name):
         self._ensure_arm_sdk_released("执行预设动作前")
+        if self._g1_remote_mode and self._g1_remote:
+            try:
+                self._g1_remote.action(name=name)
+                self._log(f"[动作] {ACTION_CN.get(name, name)}")
+            except Exception as e:
+                self._log(f"[动作] 远程执行失败: {e}")
+            return
         for aname_str, aid_val in ARM_ACTIONS.items():
             if aname_str == name:
                 self._g1_api(lambda i=aid_val: self._g1_arm.ExecuteAction(i))
@@ -2748,6 +2893,13 @@ class MainWindow(QMainWindow):
 
     def _g1_stand(self):
         self._ensure_arm_sdk_released("切换站立/行走前")
+        if self._g1_remote_mode and self._g1_remote:
+            try:
+                self._g1_remote.stand()
+                self._log("[G1远程] 行走模式")
+            except Exception as e:
+                self._log(f"[G1远程] 站起失败: {e}")
+            return
         if self._g1_ready:
             try:
                 self._g1_loco.Start()  # FSM=200 直接进入行走模式
@@ -2759,6 +2911,9 @@ class MainWindow(QMainWindow):
         if self._g1_ready and text.strip():
             try:
                 self._log(f"[语音] 播报: {text}")
+                if self._g1_remote_mode and self._g1_remote:
+                    self._g1_remote.speak(text.strip(), 0)
+                    return
                 self._g1_audio.TtsMaker(text.strip(), 0) #0女声 1男声
             except Exception as e:
                 self._log(f"[语音] 失败: {e}")
@@ -2803,6 +2958,13 @@ class MainWindow(QMainWindow):
 
     def _hand_set_preset(self, lr, preset_name):
         """通过 DDS 发送灵巧手预设手势 (lr='l'或'r')"""
+        if self._g1_remote_mode and self._g1_remote:
+            try:
+                self._g1_remote.hand_preset(lr, preset_name)
+                self._log(f"[灵巧手] {'右手' if lr == 'r' else '左手'} → {preset_name}")
+            except Exception as e:
+                self._log(f"[灵巧手] 远程控制失败: {e}")
+            return
         if not self._hand_ready:
             return
         if preset_name not in HAND_PRESETS:
@@ -2822,6 +2984,12 @@ class MainWindow(QMainWindow):
 
     def _hand_set_angles(self, lr, angles):
         """通过 DDS 发送自定义角度 (6 个 0-1000)"""
+        if self._g1_remote_mode and self._g1_remote:
+            try:
+                self._g1_remote.hand_angles(lr, angles)
+            except Exception:
+                pass
+            return
         if not self._hand_ready or len(angles) != 6:
             return
         pub = self._hand_pub_r if lr == "r" else self._hand_pub_l
@@ -2844,6 +3012,14 @@ class MainWindow(QMainWindow):
 
         arm_act, hand_preset = COORDINATED_ACTIONS[action_name]
         cn = ACTION_CN.get(arm_act, arm_act)
+
+        if self._g1_remote_mode and self._g1_remote:
+            try:
+                self._g1_remote.coordinated_action(action_name)
+                self._log(f"[协同] {cn} + {hand_preset}")
+            except Exception as e:
+                self._log(f"[协同] 远程执行失败: {e}")
+            return
 
         # 1. 执行 G1 手臂动作（与 FSM 模式无关，阻尼模式下也可执行）
         if self._g1_ready and self._g1_arm:
@@ -3054,7 +3230,10 @@ class MainWindow(QMainWindow):
             self._edit_map.setText(self.cfg["map_yaml"])
         if self.cfg.get("pcd_path"):
             self._edit_pcd.setText(self.cfg["pcd_path"])
-        if self.cfg.get("net_if"):
+        if self._g1_remote_mode:
+            self._edit_net.setText(self._g1_remote_url)
+            self._nav_net_if.setText(self._g1_remote_url)
+        elif self.cfg.get("net_if"):
             self._edit_net.setText(self.cfg["net_if"])
             self._nav_net_if.setText(self.cfg["net_if"])
 
@@ -3079,7 +3258,8 @@ class MainWindow(QMainWindow):
             self._ros_worker.stop()
             self._ros_worker.wait(2000)
         # 保存配置
-        self.cfg["net_if"] = self._nav_net_if.text().strip() or self._edit_net.text().strip()
+        if not self._g1_remote_mode:
+            self.cfg["net_if"] = self._nav_net_if.text().strip() or self._edit_net.text().strip()
         self.cfg["map_yaml"] = self._edit_map.text()
         self.cfg["pcd_path"] = self._edit_pcd.text()
         save_config(self.cfg)
@@ -3138,8 +3318,11 @@ def main():
     print("[启动] 主窗口创建完成，显示窗口…", flush=True)
     win.show()
     print("[启动] 窗口已显示，进入事件循环", flush=True)
-    if os.environ.get("HONGTU_ROBOT_MODE", "").strip() == "1":
-        print("[启动] 本体模式：1 秒后自动连接 G1", flush=True)
+    if (
+        os.environ.get("HONGTU_ROBOT_MODE", "").strip() == "1"
+        or os.environ.get("HONGTU_REMOTE_AUTO_CONNECT", "").strip() == "1"
+    ):
+        print("[启动] 自动连接 G1", flush=True)
         QTimer.singleShot(1000, win._on_g1_toggle)
     return app.exec_()
 

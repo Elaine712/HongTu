@@ -185,6 +185,46 @@ cd /home/unitree/zgx_g1
 HONGTU_G1_NET_IF=eth0 ./start_robot_gui.sh
 ```
 
+### PC 本地 GUI + G1 本体后台服务
+
+如果需要 PC 本地输入中文，同时让 arm_sdk、语音、LED 等 DDS/RPC 功能在无线下可用，推荐使用本方案：GUI 在 PC 本地运行，G1 只运行 HTTP 后台服务，DDS 始终留在 G1 本体本地。
+
+先部署：
+
+```bash
+cd ~/Desktop/HongTu
+./deploy_to_g1.sh
+```
+
+在 G1 本体启动后台服务：
+
+```bash
+ssh unitree@192.168.123.164
+cd /home/unitree/zgx_g1
+./start_g1_backend.sh
+```
+
+PC 本地启动 GUI：
+
+```bash
+cd ~/Desktop/HongTu
+./start_pc_remote_gui.sh
+```
+
+脚本会自动查找有线 `192.168.123.164:5055`、无线 `192.168.1.24:5055`，还会按当前 PC 的 WiFi 网段尝试常见地址；直连端口不通但 SSH 能通时，会自动建立 `127.0.0.1:15055 -> G1:5055` 隧道。通常不需要手动指定。也可以手动指定：
+
+```bash
+G1_BACKEND_HOST=192.168.1.24 ./start_pc_remote_gui.sh
+```
+
+网页控制台也由 G1 后台服务提供，浏览器打开：
+
+```text
+http://192.168.1.24:5055/
+```
+
+后台服务只在 `/home/unitree/zgx_g1` 项目目录内运行，使用 `.runtime/` 隔离 Python 依赖，不修改 G1 系统 Python。服务包含遥控超时自动 `StopMove` 和执行预设动作前自动释放 `arm_sdk` 的安全保护。
+
 ## 公司招聘
 招聘岗位：  
 - Slam导航算法工程师  

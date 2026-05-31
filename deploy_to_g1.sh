@@ -24,8 +24,8 @@ rsync -az --delete \
     --exclude='G1Nav2D/devel/' \
     "$BASE/" "${REMOTE}:${G1_DIR}/"
 
-ssh "$REMOTE" "cd '${G1_DIR}' && chmod +x start_robot_gui.sh deploy_to_g1.sh remote_robot_gui.sh"
+ssh "$REMOTE" "cd '${G1_DIR}' && chmod +x start_robot_gui.sh start_g1_backend.sh start_pc_remote_gui.sh deploy_to_g1.sh remote_robot_gui.sh g1_robot_service.py g1_remote_client.py"
 
 echo "[deploy] done"
 echo "[deploy] remote start:"
-echo "  ssh -Y -C ${REMOTE} 'cd ${G1_DIR} && ./start_robot_gui.sh'"
+echo "  ssh ${REMOTE} 'cd ${G1_DIR} && ./start_g1_backend.sh'"
