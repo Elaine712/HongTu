@@ -245,14 +245,30 @@ WRIST_MOTORS = {
 # ============================================================
 # 配置
 # ============================================================
-CONFIG_FILE = os.path.expanduser("~/.g1_nav_panel.json")
+APP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+CONFIG_FILE = os.environ.get(
+    "HONGTU_CONFIG_FILE",
+    os.path.expanduser("~/.g1_nav_panel.json"),
+)
 DEFAULT_CONFIG = {
-    "net_if": "eno1",
-    "map_yaml": os.path.expanduser("~/Desktop/G1map.yaml"),
-    "pcd_path": os.path.expanduser("~/Desktop/HongTu/G1Nav2D/src/fastlio2/PCD/map.pcd"),
+    "net_if": os.environ.get("HONGTU_G1_NET_IF", "eno1"),
+    "map_yaml": os.environ.get("HONGTU_MAP_YAML", os.path.expanduser("~/Desktop/G1map.yaml")),
+    "pcd_path": os.environ.get(
+        "HONGTU_PCD_PATH",
+        os.path.join(APP_ROOT, "G1Nav2D/src/fastlio2/PCD/map.pcd"),
+    ),
     "auto_start_ros": True,
     "window_geometry": None,
 }
+
+
+def init_unitree_channel(net_if):
+    """Initialize Unitree DDS; empty/auto lets robot-side SDK choose locally."""
+    net_if = (net_if or "").strip()
+    if net_if and net_if.lower() not in ("auto", "local", "none"):
+        ChannelFactoryInitialize(0, net_if)
+    else:
+        ChannelFactoryInitialize(0)
 
 NAV_STATUS_MAP = {
     0: "排队中", 1: "导航中", 2: "被抢占",
@@ -922,6 +938,11 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         toolbar.addWidget(QLabel("G1 网卡:"))
         self._nav_net_if = QLineEdit(self.cfg.get("net_if", "eno1"))
+        self._nav_net_if.setPlaceholderText("auto / eth0 / eno1")
+        self._nav_net_if.setToolTip(
+            "本体部署推荐填写 auto。手动连接时填写 G1 本体上的 DDS 网卡名，"
+            "不是 PC 的网卡名；常见为 eth0，老版/PC 有线为 eno1。"
+        )
         self._nav_net_if.setFixedWidth(96)
         toolbar.addWidget(self._nav_net_if)
 
@@ -962,15 +983,17 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self._step_label)
 
         # 标签页
-        tabs = QTabWidget()
-        tabs.addTab(self._build_nav_tab(), "📍 导航")
-        tabs.addTab(self._build_teleop_tab(), "🎮 遥控")
-        tabs.addTab(self._build_waypoint_tab(), "📍 航点")
-        tabs.addTab(self._build_action_tab(), "🤖 动作")
-        tabs.addTab(self._build_hand_tab(), "🖐 灵巧手")
-        tabs.addTab(self._build_pose_tab(), "🎬 姿态")
-        tabs.addTab(self._build_settings_tab(), "⚙ 设置")
-        main_layout.addWidget(tabs, 1)
+        self._tabs = QTabWidget()
+        self._pose_tab_index = -1
+        self._tabs.addTab(self._build_nav_tab(), "📍 导航")
+        self._tabs.addTab(self._build_teleop_tab(), "🎮 遥控")
+        self._tabs.addTab(self._build_waypoint_tab(), "📍 航点")
+        self._tabs.addTab(self._build_action_tab(), "🤖 动作")
+        self._tabs.addTab(self._build_hand_tab(), "🖐 灵巧手")
+        self._pose_tab_index = self._tabs.addTab(self._build_pose_tab(), "🎬 姿态")
+        self._tabs.addTab(self._build_settings_tab(), "⚙ 设置")
+        self._tabs.currentChanged.connect(self._on_main_tab_changed)
+        main_layout.addWidget(self._tabs, 1)
 
         # 状态栏
         self._status_bar = QStatusBar()
@@ -1313,7 +1336,7 @@ class MainWindow(QMainWindow):
             if fid == -1:
                 btn.clicked.connect(self._g1_stand)
             else:
-                btn.clicked.connect(lambda checked, f=fid: self._g1_api(lambda: self._g1_loco.SetFsmId(f)))
+                btn.clicked.connect(lambda checked, f=fid: self._g1_fsm_api(lambda: self._g1_loco.SetFsmId(f)))
             gl.addWidget(btn)
         gl.addStretch()
         layout.addWidget(grp)
@@ -1446,7 +1469,7 @@ class MainWindow(QMainWindow):
         gl.addWidget(QLabel("音量:"))
         self._vol_slider = QSlider(Qt.Horizontal)
         self._vol_slider.setRange(0, 100)
-        self._vol_slider.setValue(50)
+        self._vol_slider.setValue(100)
         self._vol_slider.valueChanged.connect(lambda v: self._g1_api(lambda: self._g1_audio.SetVolume(v)))
         gl.addWidget(self._vol_slider)
         layout.addWidget(grp)
@@ -1821,6 +1844,23 @@ class MainWindow(QMainWindow):
             self._arm_sdk_active = False
             with self._arm_sdk_target_lock:
                 self._arm_sdk_weight = 0.0
+
+    def _ensure_arm_sdk_released(self, reason=""):
+        """Release low-level arm control before leaving pose mode or running actions."""
+        if not getattr(self, "_arm_sdk_active", False):
+            return
+        if reason:
+            self._log(f"[安全] {reason}，自动释放 arm_sdk")
+        self._arm_sdk_release()
+        if hasattr(self, "_pose_arm_activate"):
+            self._pose_arm_activate.setText("⚠ 激活臂控")
+            self._pose_arm_activate.setStyleSheet("font-weight:bold; color:#fff; background:#e67e22;")
+        if hasattr(self, "_pose_arm_progress"):
+            self._pose_arm_progress.setValue(0)
+
+    def _on_main_tab_changed(self, idx):
+        if idx != getattr(self, "_pose_tab_index", -1):
+            self._ensure_arm_sdk_released("离开姿态臂控界面")
 
     def _arm_sdk_set_joints(self, angles):
         """设置目标关节角度"""
@@ -2289,7 +2329,7 @@ class MainWindow(QMainWindow):
             "<li><b>航点</b> — 记录当前位置为航点，支持单点导航和多点巡航</li>"
             "<li><b>动作</b> — 连接 G1 后可执行手臂动作和语音播报</li>"
             "</ol>"
-            "<p style='color:#888'>项目路径: ~/Desktop/HongTu/g1_nav_panel/</p>"
+            f"<p style='color:#888'>项目路径: {os.path.join(APP_ROOT, 'g1_nav_panel')}</p>"
         )
         info.setWordWrap(True)
         info.setStyleSheet("padding: 16px; font-size: 12px;")
@@ -2436,7 +2476,7 @@ class MainWindow(QMainWindow):
         net_if = self._nav_net_if.text().strip()
         try:
             self._log(f"[G1] 初始化 DDS (net_if={net_if})…")
-            ChannelFactoryInitialize(0, net_if)
+            init_unitree_channel(net_if)
             self._log("[G1] LocoClient…")
             self._g1_loco = LocoClient()
             self._g1_loco.SetTimeout(10.0)
@@ -2456,7 +2496,7 @@ class MainWindow(QMainWindow):
             self._g1_audio = G1AudioClient()
             self._g1_audio.SetTimeout(10.0)
             self._g1_audio.Init()
-            self._g1_audio.SetVolume(85)
+            self._g1_audio.SetVolume(100)
             self._log("[G1] AudioClient 就绪")
             # 修补 SDK bug：原代码 self.tts_index += self.tts_index 永远是 0
             import types
@@ -2681,14 +2721,25 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+    def _g1_fsm_api(self, func):
+        self._ensure_arm_sdk_released("切换 FSM 模式前")
+        self._g1_api(func)
+
     def _g1_move(self, vx, vy, wz):
-        if self._g1_ready:
-            try:
-                self._g1_loco.Move(vx, vy, wz, continous_move=False)
-            except Exception:
-                pass
+        if not self._g1_ready:
+            now = time.time()
+            last = getattr(self, "_last_move_not_ready_log", 0.0)
+            if now - last > 2.0:
+                self._last_move_not_ready_log = now
+                self._log("[遥控] G1 未连接，点击“连接 G1”或等待本体模式自动连接")
+            return
+        try:
+            self._g1_loco.Move(vx, vy, wz, continous_move=False)
+        except Exception as e:
+            self._log(f"[遥控] 发送移动失败: {e}")
 
     def _g1_arm_action(self, name):
+        self._ensure_arm_sdk_released("执行预设动作前")
         for aname_str, aid_val in ARM_ACTIONS.items():
             if aname_str == name:
                 self._g1_api(lambda i=aid_val: self._g1_arm.ExecuteAction(i))
@@ -2696,6 +2747,7 @@ class MainWindow(QMainWindow):
                 break
 
     def _g1_stand(self):
+        self._ensure_arm_sdk_released("切换站立/行走前")
         if self._g1_ready:
             try:
                 self._g1_loco.Start()  # FSM=200 直接进入行走模式
@@ -2785,6 +2837,7 @@ class MainWindow(QMainWindow):
 
     def _g1_coordinated_action(self, action_name):
         """同时执行 G1 手臂动作 + 灵巧手手势（右手）"""
+        self._ensure_arm_sdk_released("执行协同动作前")
         if action_name not in COORDINATED_ACTIONS:
             self._g1_arm_action(action_name)
             return
@@ -3074,9 +3127,20 @@ def main():
     app.setStyle("Fusion")
     app.setApplicationName("G1 导航控制台")
     win = MainWindow()
+    forced_net_if = os.environ.get("HONGTU_G1_NET_IF", "").strip()
+    if os.environ.get("HONGTU_FORCE_NET_IF", "").strip() == "1" and forced_net_if:
+        try:
+            win._nav_net_if.setText(forced_net_if)
+            win._edit_net.setText(forced_net_if)
+            win.cfg["net_if"] = forced_net_if
+        except Exception:
+            pass
     print("[启动] 主窗口创建完成，显示窗口…", flush=True)
     win.show()
     print("[启动] 窗口已显示，进入事件循环", flush=True)
+    if os.environ.get("HONGTU_ROBOT_MODE", "").strip() == "1":
+        print("[启动] 本体模式：1 秒后自动连接 G1", flush=True)
+        QTimer.singleShot(1000, win._on_g1_toggle)
     return app.exec_()
 
 

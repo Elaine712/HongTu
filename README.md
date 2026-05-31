@@ -141,6 +141,50 @@
   ```
 实现语音交互导航需要同时开启语音、运控、导航。
 
+### G1 本体部署远程 GUI
+无线全功能推荐把 GUI 和控制进程部署到 G1 本体运行，PC 只通过 SSH X11、VNC 或 NoMachine 远程显示。这样 DDS、arm_sdk、AudioClient、LED 都在 G1 本体本地执行，不再依赖 WiFi 路由器转发 DDS 多播。
+
+PC 通过有线连接 G1 后部署：
+
+```bash
+cd ~/Desktop/HongTu
+./deploy_to_g1.sh
+```
+
+部署目录默认是 G1 的 `/home/unitree/zgx_g1`，运行配置保存在该目录的 `.runtime/`，不会修改 G1 系统 Python 环境，也不会覆盖本体其他工程。可用环境变量覆盖：
+
+```bash
+G1_HOST=192.168.123.164 G1_USER=unitree G1_DIR=/home/unitree/zgx_g1 ./deploy_to_g1.sh
+```
+
+远程启动 GUI。Ubuntu PC 有图形桌面时可以直接用 SSH X11 转发，脚本内部使用 `ssh -Y -C`：
+
+```bash
+./remote_robot_gui.sh
+```
+
+脚本会自动优先尝试有线 `192.168.123.164`，不通再尝试 WiFi `192.168.1.24`，并会根据当前 WiFi 网段尝试常见 G1 地址。也可以手动指定：
+
+```bash
+G1_HOST=192.168.1.24 ./remote_robot_gui.sh
+```
+
+或手动：
+
+```bash
+ssh -Y -C unitree@192.168.123.164
+cd /home/unitree/zgx_g1
+./start_robot_gui.sh
+```
+
+如果 SSH X11 窗口延迟较大，推荐在 G1 上使用 NoMachine/VNC 远程桌面，再在远程桌面终端执行 `./start_robot_gui.sh`。
+
+本体运行时默认 `HONGTU_G1_NET_IF=auto`，即由 Unitree SDK 在本地选择 DDS 通道。如果现场必须指定网卡：
+
+```bash
+HONGTU_G1_NET_IF=eth0 ./start_robot_gui.sh
+```
+
 ## 公司招聘
 招聘岗位：  
 - Slam导航算法工程师  
